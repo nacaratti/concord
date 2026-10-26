@@ -28,12 +28,15 @@ services:
     build: ../server
     environment:
       DATABASE_URL: postgres://concord:${POSTGRES_PASSWORD:-concord}@postgres:5432/concord?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
       CONCORD_ADDR: ":8080"
     ports:
       - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
 
 volumes:
   pgdata:

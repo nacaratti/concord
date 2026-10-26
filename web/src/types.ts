@@ -16,6 +16,13 @@ export interface Channel {
   name: string
   kind: number
   position: number
+  last_message_id: Snowflake | null
+}
+
+export interface ReadState {
+  channel_id: Snowflake
+  last_read_id: Snowflake
+  mention_count: number
 }
 
 export interface Member {

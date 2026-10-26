@@ -9,12 +9,14 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 
 	"concord/internal/auth"
+	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
 	"concord/internal/store"
 )
@@ -157,6 +159,10 @@ type Hub struct {
 	store   *store.Store
 	log     *slog.Logger
 	origins []string
+
+	// Limiter, quando definido, limita conexões novas por IP.
+	Limiter    *ratelimit.Limiter
+	TrustProxy bool
 
 	mu        sync.Mutex
 	sessions  map[string]*Session
@@ -304,6 +310,13 @@ func (h *Hub) Presence(userID ID) Presence {
 // ---- ciclo de vida de uma conexão ----
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.Limiter != nil {
+		if ok, wait := h.Limiter.Allow(r.Context(), ratelimit.Identify, ratelimit.ClientIP(r, h.TrustProxy)); !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+0.999)))
+			http.Error(w, "conexões demais, tente de novo em instantes", http.StatusTooManyRequests)
+			return
+		}
+	}
 	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: h.origins})
 	if err != nil {
 		return
@@ -425,6 +438,10 @@ func (h *Hub) identify(ctx context.Context, c *conn, user store.User) (*Session,
 	if err != nil {
 		return nil, err
 	}
+	readStates, err := h.store.ReadStates(ctx, user.ID, user.Username)
+	if err != nil {
+		return nil, err
+	}
 	s := &Session{ID: newSessionID(), UserID: user.ID, guilds: map[ID]struct{}{}, conn: c}
 
 	h.mu.Lock()
@@ -450,10 +467,11 @@ func (h *Hub) identify(ctx context.Context, c *conn, user store.User) (*Session,
 	}
 	// READY sai como seq 1, antes que qualquer outro evento alcance esta sessão.
 	s.dispatch("READY", raw(map[string]any{
-		"session_id": s.ID,
-		"user":       user,
-		"guilds":     guilds,
-		"presences":  h.presencesLocked(memberIDs),
+		"session_id":  s.ID,
+		"user":        user,
+		"guilds":      guilds,
+		"presences":   h.presencesLocked(memberIDs),
+		"read_states": readStates,
 	}))
 	me := h.presences[user.ID]
 	h.mu.Unlock()

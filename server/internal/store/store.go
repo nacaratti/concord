@@ -6,6 +6,7 @@ import (
 	"embed"
 	"errors"
 	"io/fs"
+	"regexp"
 	"sort"
 	"time"
 
@@ -37,16 +38,24 @@ type User struct {
 }
 
 type Channel struct {
-	ID       ID     `json:"id"`
-	GuildID  ID     `json:"guild_id"`
-	Name     string `json:"name"`
-	Kind     int    `json:"kind"`
-	Position int    `json:"position"`
+	ID            ID     `json:"id"`
+	GuildID       ID     `json:"guild_id"`
+	Name          string `json:"name"`
+	Kind          int    `json:"kind"`
+	Position      int    `json:"position"`
+	LastMessageID *ID    `json:"last_message_id"`
+}
+
+// ReadState é até onde o usuário leu um canal, e quantas menções a ele chegaram depois disso.
+type ReadState struct {
+	ChannelID    ID  `json:"channel_id"`
+	LastReadID   ID  `json:"last_read_id"`
+	MentionCount int `json:"mention_count"`
 }
 
 type Member struct {
-	User     User    `json:"user"`
-	Nickname *string `json:"nickname"`
+	User     User      `json:"user"`
+	Nickname *string   `json:"nickname"`
 	JoinedAt time.Time `json:"joined_at"`
 }
 
@@ -226,13 +235,16 @@ func (s *Store) Guild(ctx context.Context, id ID) (Guild, error) {
 	if err != nil {
 		return g, notFound(err)
 	}
-	rows, err := s.DB.Query(ctx, `SELECT id, guild_id, name, kind, position FROM channels WHERE guild_id = $1 ORDER BY kind, position, id`, id)
+	// last_message_id sai do índice (channel_id, id DESC): uma leitura por canal.
+	rows, err := s.DB.Query(ctx, `SELECT c.id, c.guild_id, c.name, c.kind, c.position,
+		(SELECT m.id FROM messages m WHERE m.channel_id = c.id ORDER BY m.id DESC LIMIT 1)
+		FROM channels c WHERE c.guild_id = $1 ORDER BY c.kind, c.position, c.id`, id)
 	if err != nil {
 		return g, err
 	}
 	g.Channels, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (Channel, error) {
 		var c Channel
-		err := r.Scan(&c.ID, &c.GuildID, &c.Name, &c.Kind, &c.Position)
+		err := r.Scan(&c.ID, &c.GuildID, &c.Name, &c.Kind, &c.Position, &c.LastMessageID)
 		return c, err
 	})
 	if err != nil {
@@ -392,4 +404,41 @@ func (s *Store) UpdateMessage(ctx context.Context, id ID, content string) (Messa
 func (s *Store) DeleteMessage(ctx context.Context, id ID) error {
 	_, err := s.DB.Exec(ctx, `DELETE FROM messages WHERE id = $1`, id)
 	return err
+}
+
+// ---- estado de leitura ----
+
+// mentionPattern casa "@usuario" como palavra inteira, no dialeto de regex do Postgres (\M = fim de palavra).
+func mentionPattern(username string) string {
+	return `(^|\s)@` + regexp.QuoteMeta(username) + `\M`
+}
+
+// ReadStates devolve, para cada canal de texto dos servidores do usuário, até onde ele leu
+// e quantas menções a ele chegaram depois. Canal nunca lido conta como lido até o id 0.
+func (s *Store) ReadStates(ctx context.Context, userID ID, username string) ([]ReadState, error) {
+	rows, err := s.DB.Query(ctx, `SELECT c.id, COALESCE(rs.last_read_id, 0),
+		(SELECT count(*) FROM messages m
+		  WHERE m.channel_id = c.id AND m.id > COALESCE(rs.last_read_id, 0)
+		    AND m.author_id <> $1 AND m.content ~* $2)
+		FROM channels c
+		JOIN members mb ON mb.guild_id = c.guild_id AND mb.user_id = $1
+		LEFT JOIN read_states rs ON rs.channel_id = c.id AND rs.user_id = $1
+		WHERE c.kind = $3`, userID, mentionPattern(username), ChannelText)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (ReadState, error) {
+		var rs ReadState
+		err := r.Scan(&rs.ChannelID, &rs.LastReadID, &rs.MentionCount)
+		return rs, err
+	})
+}
+
+// Ack marca o canal como lido até messageID. Nunca anda para trás: devolve o valor efetivo.
+func (s *Store) Ack(ctx context.Context, userID, channelID, messageID ID) (ID, error) {
+	var last ID
+	err := s.DB.QueryRow(ctx, `INSERT INTO read_states (user_id, channel_id, last_read_id) VALUES ($1, $2, $3)
+		ON CONFLICT (user_id, channel_id) DO UPDATE SET last_read_id = GREATEST(read_states.last_read_id, EXCLUDED.last_read_id)
+		RETURNING last_read_id`, userID, channelID, messageID).Scan(&last)
+	return last, err
 }

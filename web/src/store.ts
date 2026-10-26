@@ -1,7 +1,16 @@
 import { create } from 'zustand'
-import { api, getToken, setToken } from './api'
+import { api, ApiError, getToken, setToken } from './api'
 import { Gateway, type ConnectionState } from './gateway'
-import { CHANNEL_TEXT, type Channel, type Guild, type Member, type Message, type Presence, type User } from './types'
+import {
+  CHANNEL_TEXT,
+  type Channel,
+  type Guild,
+  type Member,
+  type Message,
+  type Presence,
+  type ReadState,
+  type User,
+} from './types'
 
 interface State {
   me: User | null
@@ -17,8 +26,8 @@ interface State {
   loading: Record<string, boolean>
   /** canal → usuário → instante (ms) em que o "digitando" expira */
   typing: Record<string, Record<string, number>>
-  unread: Record<string, boolean>
-  mentioned: Record<string, boolean>
+  /** Até onde li cada canal, persistido no servidor (read_states). */
+  readStates: Record<string, ReadState>
   selectedGuild: string | null
   selectedChannel: Record<string, string>
   myStatus: Presence['status']
@@ -52,8 +61,7 @@ const initial: State = {
   hasMore: {},
   loading: {},
   typing: {},
-  unread: {},
-  mentioned: {},
+  readStates: {},
   selectedGuild: null,
   selectedChannel: {},
   myStatus: 'online',
@@ -80,8 +88,33 @@ function upsert(list: Message[], msg: Message): Message[] {
 
 export function mentionsMe(content: string, me: User | null): boolean {
   if (!me) return false
-  return new RegExp(`(^|\\s)@${me.username}\\b`, 'i').test(content)
+  const name = me.username.replace(/[.]/g, '\\.')
+  return new RegExp(`(^|\\s)@${name}\\b`, 'i').test(content)
 }
+
+/** Compara Snowflakes (strings de 64 bits) sem perder precisão. */
+function newer(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a) return false
+  if (!b) return true
+  return BigInt(a) > BigInt(b)
+}
+
+export function isUnread(c: Channel, readStates: Record<string, ReadState>): boolean {
+  return c.kind === CHANNEL_TEXT && newer(c.last_message_id, readStates[c.id]?.last_read_id ?? '0')
+}
+
+export function mentionCount(c: Channel, readStates: Record<string, ReadState>): number {
+  return readStates[c.id]?.mention_count ?? 0
+}
+
+/** Atualiza um canal dentro do mapa de servidores, sem mutar o estado. */
+function patchChannel(guilds: Record<string, Guild>, guildId: string, channelId: string, patch: Partial<Channel>) {
+  const g = guilds[guildId]
+  if (!g) return guilds
+  return { ...guilds, [guildId]: { ...g, channels: g.channels.map((c) => (c.id === channelId ? { ...c, ...patch } : c)) } }
+}
+
+const ackTimers: Record<string, number> = {}
 
 export const useStore = create<State & Actions>()((set, get) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -94,6 +127,8 @@ export const useStore = create<State & Actions>()((set, get) => {
         const presences: Record<string, Presence> = {}
         for (const p of d.presences as Presence[]) presences[p.user_id] = p
         const order = (d.guilds as Guild[]).map((g) => g.id)
+        const readStates: Record<string, ReadState> = {}
+        for (const rs of d.read_states as ReadState[]) readStates[rs.channel_id] = rs
         // Sessão nova (não RESUME): o cache de mensagens pode ter buracos, descarta.
         set({
           me: d.user,
@@ -101,6 +136,7 @@ export const useStore = create<State & Actions>()((set, get) => {
           guilds,
           guildOrder: order,
           presences,
+          readStates,
           messages: {},
           hasMore: {},
           typing: {},
@@ -157,18 +193,25 @@ export const useStore = create<State & Actions>()((set, get) => {
           delete rest[m.author.id]
           set({ typing: { ...s.typing, [m.channel_id]: rest } })
         }
-        const viewing = s.selectedGuild === m.guild_id && s.selectedChannel[m.guild_id] === m.channel_id
         if (s.messages[m.channel_id]) {
-          set({ messages: { ...s.messages, [m.channel_id]: upsert(s.messages[m.channel_id], m) } })
+          set({ messages: { ...get().messages, [m.channel_id]: upsert(get().messages[m.channel_id], m) } })
         }
-        if (!viewing && m.author.id !== s.me?.id) {
-          set({
-            unread: { ...get().unread, [m.channel_id]: true },
-            mentioned: mentionsMe(m.content, s.me) ? { ...get().mentioned, [m.channel_id]: true } : get().mentioned,
-          })
+        set({ guilds: patchChannel(get().guilds, m.guild_id, m.channel_id, { last_message_id: m.id }) })
+        if (m.author.id === s.me?.id) {
+          // O servidor já marcou como lido até a própria mensagem.
+          markRead(m.channel_id, m.id)
+        } else if (isViewing(m.channel_id)) {
+          ackSoon(m.channel_id)
+        } else if (mentionsMe(m.content, s.me)) {
+          const rs = get().readStates[m.channel_id] ?? { channel_id: m.channel_id, last_read_id: '0', mention_count: 0 }
+          set({ readStates: { ...get().readStates, [m.channel_id]: { ...rs, mention_count: rs.mention_count + 1 } } })
         }
         break
       }
+      case 'MESSAGE_ACK':
+        // Outra aba (ou outro dispositivo) leu este canal.
+        markRead(d.channel_id, d.message_id)
+        break
       case 'MESSAGE_UPDATE': {
         const m = d as Message
         const list = s.messages[m.channel_id]
@@ -207,12 +250,56 @@ export const useStore = create<State & Actions>()((set, get) => {
 
   if (initial.token) queueMicrotask(() => startGateway(initial.token!))
 
-  async function deliver(channelId: string, msg: Message) {
+  function findChannel(channelId: string): Channel | undefined {
+    for (const g of Object.values(get().guilds)) {
+      const c = g.channels.find((x) => x.id === channelId)
+      if (c) return c
+    }
+  }
+
+  /** O canal está aberto e a janela em foco: o que chega é lido na hora. */
+  function isViewing(channelId: string): boolean {
+    const s = get()
+    return !!s.selectedGuild && s.selectedChannel[s.selectedGuild] === channelId && document.hasFocus()
+  }
+
+  function markRead(channelId: string, messageId: string) {
+    const rs = get().readStates[channelId]
+    if (rs && !newer(messageId, rs.last_read_id) && rs.mention_count === 0) return
+    const last = rs && !newer(messageId, rs.last_read_id) ? rs.last_read_id : messageId
+    set({ readStates: { ...get().readStates, [channelId]: { channel_id: channelId, last_read_id: last, mention_count: 0 } } })
+  }
+
+  /** Marca como lido já na tela e avisa o servidor com um pequeno atraso, agrupando rajadas. */
+  function ackSoon(channelId: string) {
+    const c = findChannel(channelId)
+    if (!c?.last_message_id || !isUnread(c, get().readStates)) return
+    markRead(channelId, c.last_message_id)
+    window.clearTimeout(ackTimers[channelId])
+    ackTimers[channelId] = window.setTimeout(() => {
+      const latest = findChannel(channelId)?.last_message_id
+      if (latest) void api.ack(channelId, latest).catch(() => {})
+    }, 400)
+  }
+
+  // Ao voltar para a janela, o canal aberto conta como lido.
+  window.addEventListener('focus', () => {
+    const s = get()
+    const ch = s.selectedGuild ? s.selectedChannel[s.selectedGuild] : undefined
+    if (ch) ackSoon(ch)
+  })
+
+  async function deliver(channelId: string, msg: Message, attempt = 0) {
     try {
       const real = await api.sendMessage(channelId, msg.content, msg.nonce!)
       const list = get().messages[channelId] ?? []
       set({ messages: { ...get().messages, [channelId]: upsert(list, { ...real, nonce: msg.nonce }) } })
-    } catch {
+    } catch (err) {
+      // Rate limit: a mensagem fica pendente e sai sozinha quando o balde tiver ficha de novo.
+      if (err instanceof ApiError && err.status === 429 && attempt < 5) {
+        await new Promise((r) => setTimeout(r, err.retryAfter * 1000 + 50))
+        return deliver(channelId, msg, attempt + 1)
+      }
       const list = get().messages[channelId] ?? []
       set({
         messages: {
@@ -249,11 +336,8 @@ export const useStore = create<State & Actions>()((set, get) => {
     },
 
     selectChannel(guildId, channelId) {
-      const unread = { ...get().unread }
-      const mentioned = { ...get().mentioned }
-      delete unread[channelId]
-      delete mentioned[channelId]
-      set({ selectedGuild: guildId, selectedChannel: { ...get().selectedChannel, [guildId]: channelId }, unread, mentioned })
+      set({ selectedGuild: guildId, selectedChannel: { ...get().selectedChannel, [guildId]: channelId } })
+      ackSoon(channelId)
       if (!get().messages[channelId]) void get().loadMessages(channelId)
     },
 

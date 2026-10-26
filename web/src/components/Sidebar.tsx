@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { api } from '../api'
-import { useStore } from '../store'
+import { isUnread, mentionCount, useStore } from '../store'
 import { CHANNEL_TEXT, CHANNEL_VOICE, type Invite, type Status } from '../types'
 import { Avatar, statusLabel } from './Avatar'
 import { Modal } from './Modal'
@@ -14,13 +14,14 @@ function initials(name: string) {
 }
 
 export function GuildBar({ onJoin }: { onJoin: () => void }) {
-  const { guildOrder, guilds, selectedGuild, selectGuild, unread } = useStore()
+  const { guildOrder, guilds, selectedGuild, selectGuild, readStates } = useStore()
   const [creating, setCreating] = useState(false)
   return (
     <nav className="guildbar">
       {guildOrder.map((id) => {
         const g = guilds[id]
-        const hasUnread = g.channels.some((c) => unread[c.id])
+        const hasUnread = g.channels.some((c) => isUnread(c, readStates))
+        const mentions = g.channels.reduce((n, c) => n + mentionCount(c, readStates), 0)
         return (
           <button
             key={id}
@@ -29,6 +30,7 @@ export function GuildBar({ onJoin }: { onJoin: () => void }) {
             onClick={() => selectGuild(id)}
           >
             {initials(g.name)}
+            {mentions > 0 && <span className="badge guild-badge">{mentions}</span>}
           </button>
         )
       })}
@@ -132,7 +134,7 @@ export function JoinModal({ initialCode, onClose }: { initialCode?: string; onCl
 }
 
 export function ChannelSidebar() {
-  const { guilds, selectedGuild, selectedChannel, selectChannel, unread, mentioned } = useStore()
+  const { guilds, selectedGuild, selectedChannel, selectChannel, readStates } = useStore()
   const g = selectedGuild ? guilds[selectedGuild] : null
   const [inviting, setInviting] = useState(false)
   const [creatingKind, setCreatingKind] = useState<number | null>(null)
@@ -164,12 +166,12 @@ export function ChannelSidebar() {
                   kind === CHANNEL_TEXT ? (
                     <button
                       key={c.id}
-                      className={`channel ${selectedChannel[g.id] === c.id ? 'active' : ''} ${unread[c.id] ? 'unread' : ''}`}
+                      className={`channel ${selectedChannel[g.id] === c.id ? 'active' : ''} ${isUnread(c, readStates) ? 'unread' : ''}`}
                       onClick={() => selectChannel(g.id, c.id)}
                     >
                       <span className="hash">#</span>
                       <span className="ellipsis">{c.name}</span>
-                      {mentioned[c.id] && <span className="badge">@</span>}
+                      {mentionCount(c, readStates) > 0 && <span className="badge">{mentionCount(c, readStates)}</span>}
                     </button>
                   ) : (
                     <div key={c.id} className="channel voice" title="Voz chega na Fase 3 (LiveKit)">

@@ -21,9 +21,12 @@ export function setToken(token: string | null) {
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  /** Segundos até poder tentar de novo, quando o servidor respondeu 429. */
+  retryAfter: number
+  constructor(status: number, message: string, retryAfter = 0) {
     super(message)
     this.status = status
+    this.retryAfter = retryAfter
   }
 }
 
@@ -39,7 +42,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   })
   if (res.status === 204) return undefined as T
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new ApiError(res.status, data.message ?? `Erro ${res.status}`)
+  if (!res.ok) throw new ApiError(res.status, data.message ?? `Erro ${res.status}`, data.retry_after ?? 0)
   return data as T
 }
 
@@ -69,4 +72,6 @@ export const api = {
     request<Message>('PATCH', `/channels/${channelId}/messages/${id}`, { content }),
   deleteMessage: (channelId: string, id: string) => request<void>('DELETE', `/channels/${channelId}/messages/${id}`),
   typing: (channelId: string) => request<void>('POST', `/channels/${channelId}/typing`),
+  ack: (channelId: string, messageId: string) =>
+    request<void>('POST', `/channels/${channelId}/messages/${messageId}/ack`),
 }

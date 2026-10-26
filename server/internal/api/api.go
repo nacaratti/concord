@@ -16,6 +16,7 @@ import (
 
 	"concord/internal/auth"
 	"concord/internal/gateway"
+	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
 	"concord/internal/store"
 )
@@ -23,10 +24,13 @@ import (
 type ID = snowflake.ID
 
 type API struct {
-	Store *store.Store
-	Hub   *gateway.Hub
-	IDs   *snowflake.Generator
-	Log   *slog.Logger
+	Store   *store.Store
+	Hub     *gateway.Hub
+	IDs     *snowflake.Generator
+	Limiter *ratelimit.Limiter
+	Log     *slog.Logger
+	// TrustProxy faz o IP do cliente vir de X-Forwarded-For (ligue só atrás do Caddy).
+	TrustProxy bool
 }
 
 type ctxKey struct{}
@@ -48,8 +52,26 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("POST /api/channels/{channel}/messages", a.authed(a.sendMessage))
 	mux.HandleFunc("PATCH /api/channels/{channel}/messages/{message}", a.authed(a.editMessage))
 	mux.HandleFunc("DELETE /api/channels/{channel}/messages/{message}", a.authed(a.deleteMessage))
+	mux.HandleFunc("POST /api/channels/{channel}/messages/{message}/ack", a.authed(a.ack))
 	mux.HandleFunc("POST /api/channels/{channel}/typing", a.authed(a.typing))
 	return mux
+}
+
+// limited gasta uma ficha do balde; se acabou, responde 429 com retry_after (segundos) e devolve true.
+func (a *API) limited(w http.ResponseWriter, r *http.Request, rule ratelimit.Rule, key string) bool {
+	if a.Limiter == nil {
+		return false
+	}
+	ok, wait := a.Limiter.Allow(r.Context(), rule, key)
+	if ok {
+		return false
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+0.999)))
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{
+		"message":     "Calma! Você está fazendo isso rápido demais.",
+		"retry_after": wait.Seconds(),
+	})
+	return true
 }
 
 // ---- helpers ----
@@ -69,9 +91,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// errLimited indica que a resposta 429 já foi escrita.
+var errLimited = errors.New("rate limited")
+
 func (a *API) fail(w http.ResponseWriter, err error) {
 	var ae apiError
 	switch {
+	case errors.Is(err, errLimited):
 	case errors.As(err, &ae):
 		writeJSON(w, ae.Status, ae)
 	case errors.Is(err, store.ErrNotFound):
@@ -169,6 +195,9 @@ func (a *API) issueToken(ctx context.Context, u store.User) (authResponse, error
 }
 
 func (a *API) register(w http.ResponseWriter, r *http.Request) {
+	if a.limited(w, r, ratelimit.Register, ratelimit.ClientIP(r, a.TrustProxy)) {
+		return
+	}
 	var in struct {
 		Username    string `json:"username"`
 		Password    string `json:"password"`
@@ -213,6 +242,9 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
+	if a.limited(w, r, ratelimit.Login, ratelimit.ClientIP(r, a.TrustProxy)) {
+		return
+	}
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -274,6 +306,9 @@ func (a *API) guildPayload(g store.Guild) map[string]any {
 
 func (a *API) createGuild(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
+	if a.limited(w, r, ratelimit.Write, u.ID.String()) {
+		return
+	}
 	var in struct {
 		Name string `json:"name"`
 	}
@@ -307,6 +342,9 @@ func (a *API) createGuild(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) createChannel(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
+	if a.limited(w, r, ratelimit.Write, u.ID.String()) {
+		return
+	}
 	gid, err := pathID(r, "guild")
 	if err != nil {
 		a.fail(w, err)
@@ -347,6 +385,9 @@ func (a *API) createChannel(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) createInvite(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
+	if a.limited(w, r, ratelimit.Write, u.ID.String()) {
+		return
+	}
 	gid, err := pathID(r, "guild")
 	if err != nil {
 		a.fail(w, err)
@@ -398,6 +439,9 @@ func (a *API) getInvite(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) acceptInvite(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
+	if a.limited(w, r, ratelimit.Write, u.ID.String()) {
+		return
+	}
 	gid, joined, err := a.Store.UseInvite(r.Context(), r.PathValue("code"), u.ID)
 	if err != nil {
 		a.fail(w, err)
@@ -462,6 +506,9 @@ func validContent(s string) (string, error) {
 
 func (a *API) sendMessage(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
+	if a.limited(w, r, ratelimit.Message, u.ID.String()) {
+		return
+	}
 	ch, err := a.textChannelFor(r, u)
 	if err != nil {
 		a.fail(w, err)
@@ -488,13 +535,20 @@ func (a *API) sendMessage(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	// Quem escreve leu tudo até a própria mensagem.
+	if _, err := a.Store.Ack(r.Context(), u.ID, ch.ID, msg.ID); err != nil {
+		a.Log.Warn("ack automático", "err", err)
+	}
 	// O nonce volta para o autor: é assim que o cliente troca a mensagem otimista pela real.
 	msg.Nonce = in.Nonce
 	a.Hub.DispatchGuild(ch.GuildID, "MESSAGE_CREATE", msg)
 	writeJSON(w, http.StatusOK, msg)
 }
 
-func (a *API) ownMessage(r *http.Request, u store.User) (store.Message, error) {
+func (a *API) ownMessage(w http.ResponseWriter, r *http.Request, u store.User) (store.Message, error) {
+	if a.limited(w, r, ratelimit.Write, u.ID.String()) {
+		return store.Message{}, errLimited
+	}
 	ch, err := a.textChannelFor(r, u)
 	if err != nil {
 		return store.Message{}, err
@@ -518,7 +572,7 @@ func (a *API) ownMessage(r *http.Request, u store.User) (store.Message, error) {
 
 func (a *API) editMessage(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
-	msg, err := a.ownMessage(r, u)
+	msg, err := a.ownMessage(w, r, u)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -546,7 +600,7 @@ func (a *API) editMessage(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) deleteMessage(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
-	msg, err := a.ownMessage(r, u)
+	msg, err := a.ownMessage(w, r, u)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -558,6 +612,28 @@ func (a *API) deleteMessage(w http.ResponseWriter, r *http.Request) {
 	a.Hub.DispatchGuild(msg.GuildID, "MESSAGE_DELETE", map[string]any{
 		"id": msg.ID, "channel_id": msg.ChannelID, "guild_id": msg.GuildID,
 	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ack marca o canal como lido e avisa as outras sessões do mesmo usuário (outras abas, o app desktop).
+func (a *API) ack(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r)
+	ch, err := a.textChannelFor(r, u)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	mid, err := pathID(r, "message")
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	last, err := a.Store.Ack(r.Context(), u.ID, ch.ID, mid)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	a.Hub.DispatchUser(u.ID, "MESSAGE_ACK", map[string]any{"channel_id": ch.ID, "message_id": last})
 	w.WriteHeader(http.StatusNoContent)
 }
 

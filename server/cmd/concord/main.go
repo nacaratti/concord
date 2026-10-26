@@ -11,8 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"concord/internal/api"
 	"concord/internal/gateway"
+	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
 	"concord/internal/store"
 )
@@ -39,11 +42,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	ropts, err := redis.ParseURL(env("REDIS_URL", "redis://localhost:6380/0"))
+	if err != nil {
+		log.Error("REDIS_URL inválida", "err", err)
+		os.Exit(1)
+	}
+	rdb := redis.NewClient(ropts)
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Warn("redis indisponível: rate limit fica desligado até ele voltar", "err", err)
+	}
+	limiter := ratelimit.New(rdb, log)
+	trustProxy := os.Getenv("CONCORD_TRUST_PROXY") == "1"
+
 	origins := strings.Split(env("CONCORD_ORIGINS", "localhost:*,127.0.0.1:*"), ",")
 	hub := gateway.NewHub(st, log, origins)
+	hub.Limiter, hub.TrustProxy = limiter, trustProxy
 	go hub.Run(ctx)
 
-	a := &api.API{Store: st, Hub: hub, IDs: snowflake.NewGenerator(1), Log: log}
+	a := &api.API{Store: st, Hub: hub, IDs: snowflake.NewGenerator(1), Limiter: limiter, Log: log, TrustProxy: trustProxy}
 	mux := http.NewServeMux()
 	mux.Handle("/api/", a.Routes())
 	mux.Handle("GET /gateway", hub)
