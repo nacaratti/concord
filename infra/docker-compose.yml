@@ -1,0 +1,39 @@
+name: concord
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: concord
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-concord}
+      POSTGRES_DB: concord
+    ports:
+      - "5433:5432" # 5433 no host para não colidir com outro Postgres local
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U concord"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+
+  # Servidor Go (API + gateway). Em desenvolvimento, prefira rodar com `go run` fora do Docker.
+  server:
+    profiles: ["full"]
+    build: ../server
+    environment:
+      DATABASE_URL: postgres://concord:${POSTGRES_PASSWORD:-concord}@postgres:5432/concord?sslmode=disable
+      CONCORD_ADDR: ":8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
