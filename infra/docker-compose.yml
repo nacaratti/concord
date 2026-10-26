@@ -52,6 +52,24 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  # Armazenamento de arquivos compatível com S3. O plano previa MinIO, mas a imagem oficial saiu do Docker Hub
+  # em 2025; o RustFS fala a mesma API S3. Em produção dá para trocar por Cloudflare R2 só mudando as variáveis S3_*.
+  # Os arquivos são servidos daqui (outra origem), nunca do domínio do app.
+  storage:
+    image: rustfs/rustfs:1.0.4
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-concord-dev}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-concord-dev-secret-troque-em-producao}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001" # console web, só para desenvolvimento
+    volumes:
+      - s3data:/data
+
   # Servidor Go (API + gateway). Em desenvolvimento, prefira rodar com `go run` fora do Docker.
   server:
     profiles: ["full"]
@@ -70,3 +88,4 @@ services:
 
 volumes:
   pgdata:
+  s3data:

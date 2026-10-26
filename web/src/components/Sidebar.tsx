@@ -270,7 +270,7 @@ function CreateChannelModal({ guildId, kind, onClose }: { guildId: string; kind:
 }
 
 function UserPanel() {
-  const { me, myStatus, myActivity, setPresence, logout, connection, simulateDrop } = useStore()
+  const { me, myStatus, myActivity, setPresence, logout, connection, simulateDrop, enableNotifications } = useStore()
   const [open, setOpen] = useState(false)
   const [activity, setActivity] = useState(myActivity)
   if (!me) return null
@@ -306,6 +306,11 @@ function UserPanel() {
             <input value={activity} onChange={(e) => setActivity(e.target.value)} placeholder="Jogando… (ex.: Valorant)" maxLength={64} />
           </form>
           <div className="popover-sep" />
+          {typeof Notification !== 'undefined' && Notification.permission === 'default' && (
+            <button className="popover-item" onClick={() => void enableNotifications()}>
+              Ativar notificações de menção
+            </button>
+          )}
           <button className="popover-item" onClick={simulateDrop} title="Derruba o WebSocket para ver o RESUME">
             Simular queda de conexão
           </button>

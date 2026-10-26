@@ -1,0 +1,15 @@
+{
+  "name": "concord-desktop",
+  "private": true,
+  "version": "0.4.0",
+  "description": "App desktop do Concord (Tauri 2): bandeja, notificações e push-to-talk global",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icons": "tauri icon app-icon.svg"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4"
+  }
+}

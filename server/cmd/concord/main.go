@@ -14,6 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"concord/internal/api"
+	"concord/internal/files"
 	"concord/internal/gateway"
 	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
@@ -66,6 +67,25 @@ func main() {
 	go hub.Run(ctx)
 
 	a := &api.API{Store: st, Hub: hub, IDs: snowflake.NewGenerator(1), Limiter: limiter, Voice: vc, Log: log, TrustProxy: trustProxy}
+	fs, err := files.New(files.Config{
+		Endpoint:       env("S3_ENDPOINT", "localhost:9000"),
+		PublicEndpoint: env("S3_PUBLIC_ENDPOINT", "localhost:9000"),
+		AccessKey:      env("S3_ACCESS_KEY", "concord-dev"),
+		SecretKey:      env("S3_SECRET_KEY", "concord-dev-secret-troque-em-producao"),
+		Bucket:         env("S3_BUCKET", "concord"),
+		Secure:         os.Getenv("S3_SECURE") == "1",
+		PublicURL:      env("S3_PUBLIC_URL", "http://localhost:9000/concord"),
+	})
+	if err == nil {
+		sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err = fs.Setup(sctx)
+		cancel()
+	}
+	if err != nil {
+		log.Warn("armazenamento S3 indisponível: envio de arquivos desativado", "err", err)
+	} else {
+		a.Files = fs
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/api/", a.Routes())
 	mux.Handle("GET /gateway", hub)

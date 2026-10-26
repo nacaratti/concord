@@ -82,8 +82,11 @@ export class Gateway {
   }
 
   /** Entra, troca, sai (channelId null) ou só muda mute/deafen numa call. */
-  updateVoiceState(guildId: string, channelId: string | null, selfMute: boolean, selfDeaf: boolean) {
-    this.send({ op: Op.VoiceStateUpdate, d: { guild_id: guildId, channel_id: channelId, self_mute: selfMute, self_deaf: selfDeaf } })
+  updateVoiceState(guildId: string, channelId: string | null, selfMute: boolean, selfDeaf: boolean, selfStream = false) {
+    this.send({
+      op: Op.VoiceStateUpdate,
+      d: { guild_id: guildId, channel_id: channelId, self_mute: selfMute, self_deaf: selfDeaf, self_stream: selfStream },
+    })
   }
 
   get session(): string | null {

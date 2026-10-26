@@ -26,6 +26,7 @@ export interface VoiceState {
   session_id: string
   self_mute: boolean
   self_deaf: boolean
+  self_stream: boolean
 }
 
 export interface ReadState {
@@ -54,6 +55,7 @@ export interface Message {
   guild_id: Snowflake
   author: User
   content: string
+  attachments: Attachment[]
   edited_at: string | null
   timestamp: string
   nonce?: string
@@ -62,7 +64,18 @@ export interface Message {
   failed?: boolean
 }
 
-export type Status = 'online' | 'idle' | 'dnd' | 'offline'
+export interface Attachment {
+  id: Snowflake
+  filename: string
+  size: number
+  content_type: string
+  url: string
+  thumbnail_url?: string
+  width?: number
+  height?: number
+}
+
+export type Status ='online' | 'idle' | 'dnd' | 'offline'
 
 export interface Presence {
   user_id: Snowflake

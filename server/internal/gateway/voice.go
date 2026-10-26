@@ -18,6 +18,8 @@ type VoiceState struct {
 	SessionID string `json:"session_id"`
 	SelfMute  bool   `json:"self_mute"`
 	SelfDeaf  bool   `json:"self_deaf"`
+	// SelfStream: está compartilhando a tela. Vai pelo gateway para quem está fora da call ver o "AO VIVO".
+	SelfStream bool `json:"self_stream"`
 }
 
 const voiceTokenTTL = 6 * time.Hour
@@ -45,17 +47,18 @@ func (h *Hub) voiceStatesLocked(guildIDs []ID) []VoiceState {
 
 func left(vs VoiceState) VoiceState {
 	vs.ChannelID = nil
-	vs.SelfMute, vs.SelfDeaf = false, false
+	vs.SelfMute, vs.SelfDeaf, vs.SelfStream = false, false, false
 	return vs
 }
 
 // handleVoiceState trata o op 4: entrar, trocar de canal, sair, ou só mudar mute/deafen.
 func (h *Hub) handleVoiceState(ctx context.Context, s *Session, d json.RawMessage) {
 	var in struct {
-		GuildID   ID   `json:"guild_id"`
-		ChannelID *ID  `json:"channel_id"`
-		SelfMute  bool `json:"self_mute"`
-		SelfDeaf  bool `json:"self_deaf"`
+		GuildID    ID   `json:"guild_id"`
+		ChannelID  *ID  `json:"channel_id"`
+		SelfMute   bool `json:"self_mute"`
+		SelfDeaf   bool `json:"self_deaf"`
+		SelfStream bool `json:"self_stream"`
 	}
 	if json.Unmarshal(d, &in) != nil {
 		return
@@ -90,7 +93,7 @@ func (h *Hub) handleVoiceState(ctx context.Context, s *Session, d json.RawMessag
 			in.SelfMute = true // quem não ouve também não fala
 		}
 		st := VoiceState{GuildID: in.GuildID, ChannelID: in.ChannelID, UserID: s.UserID, SessionID: s.ID,
-			SelfMute: in.SelfMute, SelfDeaf: in.SelfDeaf}
+			SelfMute: in.SelfMute, SelfDeaf: in.SelfDeaf, SelfStream: in.SelfStream}
 		h.voiceStates[s.UserID] = st
 		if hadPrev && prev.GuildID != st.GuildID {
 			out = append(out, dispatch{prev.GuildID, left(prev)})

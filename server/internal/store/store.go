@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"regexp"
@@ -68,14 +69,16 @@ type Guild struct {
 }
 
 type Message struct {
-	ID        ID         `json:"id"`
-	ChannelID ID         `json:"channel_id"`
-	GuildID   ID         `json:"guild_id"`
-	Author    User       `json:"author"`
-	Content   string     `json:"content"`
-	EditedAt  *time.Time `json:"edited_at"`
-	Timestamp time.Time  `json:"timestamp"`
-	Nonce     string     `json:"nonce,omitempty"`
+	ID        ID     `json:"id"`
+	ChannelID ID     `json:"channel_id"`
+	GuildID   ID     `json:"guild_id"`
+	Author    User   `json:"author"`
+	Content   string `json:"content"`
+	// Attachments é o JSON gravado em messages.attachments (ver internal/files.Attachment).
+	Attachments json.RawMessage `json:"attachments"`
+	EditedAt    *time.Time      `json:"edited_at"`
+	Timestamp   time.Time       `json:"timestamp"`
+	Nonce       string          `json:"nonce,omitempty"`
 }
 
 type Invite struct {
@@ -360,18 +363,21 @@ func (s *Store) UseInvite(ctx context.Context, code string, userID ID) (guildID 
 
 // ---- mensagens ----
 
-const messageCols = `m.id, m.channel_id, c.guild_id, ` + userCols + `, m.content, m.edited_at`
+const messageCols = `m.id, m.channel_id, c.guild_id, ` + userCols + `, m.content, m.attachments, m.edited_at`
 
 func scanMessage(row pgx.Row) (Message, error) {
 	var m Message
-	err := row.Scan(&m.ID, &m.ChannelID, &m.GuildID, &m.Author.ID, &m.Author.Username, &m.Author.DisplayName, &m.Author.AvatarKey, &m.Content, &m.EditedAt)
+	err := row.Scan(&m.ID, &m.ChannelID, &m.GuildID, &m.Author.ID, &m.Author.Username, &m.Author.DisplayName, &m.Author.AvatarKey, &m.Content, &m.Attachments, &m.EditedAt)
 	m.Timestamp = m.ID.Time()
 	return m, err
 }
 
-func (s *Store) CreateMessage(ctx context.Context, id, channelID, authorID ID, content string) (Message, error) {
-	if _, err := s.DB.Exec(ctx, `INSERT INTO messages (id, channel_id, author_id, content) VALUES ($1, $2, $3, $4)`,
-		id, channelID, authorID, content); err != nil {
+func (s *Store) CreateMessage(ctx context.Context, id, channelID, authorID ID, content string, attachments json.RawMessage) (Message, error) {
+	if attachments == nil {
+		attachments = json.RawMessage(`[]`)
+	}
+	if _, err := s.DB.Exec(ctx, `INSERT INTO messages (id, channel_id, author_id, content, attachments) VALUES ($1, $2, $3, $4, $5)`,
+		id, channelID, authorID, content, attachments); err != nil {
 		return Message{}, err
 	}
 	return s.Message(ctx, id)
@@ -441,4 +447,65 @@ func (s *Store) Ack(ctx context.Context, userID, channelID, messageID ID) (ID, e
 		ON CONFLICT (user_id, channel_id) DO UPDATE SET last_read_id = GREATEST(read_states.last_read_id, EXCLUDED.last_read_id)
 		RETURNING last_read_id`, userID, channelID, messageID).Scan(&last)
 	return last, err
+}
+
+// ---- uploads ----
+
+type Upload struct {
+	ID        ID
+	UserID    ID
+	ChannelID ID
+	Key       string
+	Filename  string
+	Size      int64
+}
+
+var ErrUpload = errors.New("anexo inválido ou já usado")
+
+func int64s(ids []ID) []int64 {
+	out := make([]int64, len(ids))
+	for i, id := range ids {
+		out[i] = int64(id)
+	}
+	return out
+}
+
+func (s *Store) CreateUpload(ctx context.Context, u Upload) error {
+	_, err := s.DB.Exec(ctx, `INSERT INTO uploads (id, user_id, channel_id, object_key, filename, size) VALUES ($1, $2, $3, $4, $5, $6)`,
+		u.ID, u.UserID, u.ChannelID, u.Key, u.Filename, u.Size)
+	return err
+}
+
+// ClaimUploads marca os envios como usados, na ordem pedida. Ou todos são deste autor, deste canal e
+// ainda não usados, ou nada muda: assim ninguém anexa o arquivo de outra pessoa nem o mesmo duas vezes.
+func (s *Store) ClaimUploads(ctx context.Context, ids []ID, userID, channelID ID) ([]Upload, error) {
+	var out []Upload
+	err := pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `UPDATE uploads SET used = true
+			WHERE id = ANY($1) AND user_id = $2 AND channel_id = $3 AND NOT used
+			RETURNING id, user_id, channel_id, object_key, filename, size`, int64s(ids), userID, channelID)
+		if err != nil {
+			return err
+		}
+		got, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Upload, error) {
+			var u Upload
+			err := r.Scan(&u.ID, &u.UserID, &u.ChannelID, &u.Key, &u.Filename, &u.Size)
+			return u, err
+		})
+		if err != nil {
+			return err
+		}
+		if len(got) != len(ids) {
+			return ErrUpload
+		}
+		byID := map[ID]Upload{}
+		for _, u := range got {
+			byID[u.ID] = u
+		}
+		for _, id := range ids {
+			out = append(out, byID[id])
+		}
+		return nil
+	})
+	return out, err
 }

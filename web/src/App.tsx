@@ -3,6 +3,7 @@ import { Auth } from './components/Auth'
 import { Chat } from './components/Chat'
 import { Members } from './components/Members'
 import { ChannelSidebar, GuildBar, JoinModal } from './components/Sidebar'
+import { Stage } from './components/Voice'
 import { useStore } from './store'
 
 /** Lê /invite/<código> da URL uma vez e limpa o caminho. */
@@ -24,6 +25,7 @@ export default function App() {
   const selectedGuild = useStore((s) => s.selectedGuild)
   const selectedChannel = useStore((s) => s.selectedChannel)
   const selectGuild = useStore((s) => s.selectGuild)
+  const watching = useStore((s) => s.voice.watching)
   const [joining, setJoining] = useState<{ code?: string } | null>(inviteFromUrl ? { code: inviteFromUrl } : null)
 
   const guild = selectedGuild ? guilds[selectedGuild] : null
@@ -50,7 +52,9 @@ export default function App() {
       {connection !== 'connected' && <div className="conn-banner">Conexão perdida. Reconectando…</div>}
       <GuildBar onJoin={() => setJoining({})} />
       <ChannelSidebar />
-      {channel ? (
+      {watching ? (
+        <Stage userId={watching} />
+      ) : channel ? (
         <Chat key={channel.id} channel={channel} />
       ) : (
         <main className="chat empty">

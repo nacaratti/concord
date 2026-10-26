@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"concord/internal/auth"
+	"concord/internal/files"
 	"concord/internal/gateway"
 	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
@@ -31,6 +32,7 @@ type API struct {
 	IDs     *snowflake.Generator
 	Limiter *ratelimit.Limiter
 	Voice   *voice.Config
+	Files   *files.Storage
 	Log     *slog.Logger
 	// TrustProxy faz o IP do cliente vir de X-Forwarded-For (ligue só atrás do Caddy).
 	TrustProxy bool
@@ -57,6 +59,7 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("DELETE /api/channels/{channel}/messages/{message}", a.authed(a.deleteMessage))
 	mux.HandleFunc("POST /api/channels/{channel}/messages/{message}/ack", a.authed(a.ack))
 	mux.HandleFunc("POST /api/channels/{channel}/typing", a.authed(a.typing))
+	mux.HandleFunc("POST /api/channels/{channel}/attachments", a.authed(a.createAttachment))
 	mux.HandleFunc("POST /api/livekit/webhook", a.livekitWebhook)
 	return mux
 }
@@ -548,22 +551,35 @@ func (a *API) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Content string `json:"content"`
-		Nonce   string `json:"nonce"`
+		Content       string `json:"content"`
+		Nonce         string `json:"nonce"`
+		AttachmentIDs []ID   `json:"attachment_ids"`
 	}
 	if err := decode(r, &in); err != nil {
 		a.fail(w, err)
 		return
 	}
-	content, err := validContent(in.Content)
-	if err != nil {
-		a.fail(w, err)
+	content := strings.TrimSpace(in.Content)
+	// Com anexo, o texto pode ficar vazio.
+	if len(in.AttachmentIDs) == 0 || content != "" {
+		if content, err = validContent(in.Content); err != nil {
+			a.fail(w, err)
+			return
+		}
+	}
+	if len(in.AttachmentIDs) > files.MaxAttachments {
+		a.fail(w, errStatus(http.StatusBadRequest, "no máximo 10 anexos por mensagem"))
 		return
 	}
 	if len(in.Nonce) > 64 {
 		in.Nonce = ""
 	}
-	msg, err := a.Store.CreateMessage(r.Context(), a.IDs.Next(), ch.ID, u.ID, content)
+	attachments, err := a.finalizeAttachments(r.Context(), in.AttachmentIDs, u.ID, ch.ID)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	msg, err := a.Store.CreateMessage(r.Context(), a.IDs.Next(), ch.ID, u.ID, content, attachments)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -576,6 +592,78 @@ func (a *API) sendMessage(w http.ResponseWriter, r *http.Request) {
 	msg.Nonce = in.Nonce
 	a.Hub.DispatchGuild(ch.GuildID, "MESSAGE_CREATE", msg)
 	writeJSON(w, http.StatusOK, msg)
+}
+
+// createAttachment autoriza um envio: devolve uma URL pré-assinada (15 min) para o navegador mandar o
+// arquivo direto ao armazenamento, sem passar pelo servidor Go.
+func (a *API) createAttachment(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r)
+	if a.limited(w, r, ratelimit.Write, u.ID.String()) {
+		return
+	}
+	if a.Files == nil {
+		a.fail(w, errStatus(http.StatusServiceUnavailable, "envio de arquivos desativado"))
+		return
+	}
+	ch, err := a.textChannelFor(r, u)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	var in struct {
+		Filename string `json:"filename"`
+		Size     int64  `json:"size"`
+	}
+	if err := decode(r, &in); err != nil {
+		a.fail(w, err)
+		return
+	}
+	if in.Size <= 0 || in.Size > files.MaxUpload {
+		a.fail(w, errStatus(http.StatusRequestEntityTooLarge, "o arquivo deve ter até 25 MB"))
+		return
+	}
+	name := files.SafeFilename(in.Filename)
+	id := a.IDs.Next()
+	key := files.Key(ch.ID.String(), id.String(), auth.RandomCode(16), name)
+	uploadURL, err := a.Files.PresignPut(r.Context(), key)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	if err := a.Store.CreateUpload(r.Context(), store.Upload{ID: id, UserID: u.ID, ChannelID: ch.ID, Key: key, Filename: name, Size: in.Size}); err != nil {
+		a.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "filename": name, "upload_url": uploadURL})
+}
+
+// finalizeAttachments reserva os envios (só do autor, deste canal, ainda não usados) e confere cada arquivo.
+func (a *API) finalizeAttachments(ctx context.Context, ids []ID, userID, channelID ID) (json.RawMessage, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if a.Files == nil {
+		return nil, errStatus(http.StatusServiceUnavailable, "envio de arquivos desativado")
+	}
+	uploads, err := a.Store.ClaimUploads(ctx, ids, userID, channelID)
+	if errors.Is(err, store.ErrUpload) {
+		return nil, errStatus(http.StatusBadRequest, err.Error())
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]files.Attachment, 0, len(uploads))
+	for _, up := range uploads {
+		att, err := a.Files.Finalize(ctx, up.ID.String(), up.Key, up.Filename)
+		if errors.Is(err, files.ErrInvalid) {
+			return nil, errStatus(http.StatusBadRequest, up.Filename+": "+strings.TrimPrefix(err.Error(), files.ErrInvalid.Error()+": "))
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, att)
+	}
+	return json.Marshal(out)
 }
 
 func (a *API) ownMessage(w http.ResponseWriter, r *http.Request, u store.User) (store.Message, error) {

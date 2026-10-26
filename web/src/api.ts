@@ -46,6 +46,22 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T
 }
 
+/**
+ * Envia o arquivo direto ao armazenamento S3 pela URL pré-assinada, sem passar pelo servidor Go.
+ * Usa XHR (e não fetch) porque só ele informa o progresso do envio.
+ */
+export function uploadToStorage(url: string, file: File, onProgress: (fraction: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('PUT', url)
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream')
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total)
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Falha no envio (${xhr.status})`)))
+    xhr.onerror = () => reject(new Error('Falha de rede no envio'))
+    xhr.send(file)
+  })
+}
+
 interface AuthResponse {
   token: string
   user: User
@@ -66,8 +82,13 @@ export const api = {
 
   messages: (channelId: string, before?: string, limit = 50) =>
     request<Message[]>('GET', `/channels/${channelId}/messages?limit=${limit}${before ? `&before=${before}` : ''}`),
-  sendMessage: (channelId: string, content: string, nonce: string) =>
-    request<Message>('POST', `/channels/${channelId}/messages`, { content, nonce }),
+  sendMessage: (channelId: string, content: string, nonce: string, attachmentIds: string[] = []) =>
+    request<Message>('POST', `/channels/${channelId}/messages`, { content, nonce, attachment_ids: attachmentIds }),
+  createAttachment: (channelId: string, filename: string, size: number) =>
+    request<{ id: string; filename: string; upload_url: string }>('POST', `/channels/${channelId}/attachments`, {
+      filename,
+      size,
+    }),
   editMessage: (channelId: string, id: string, content: string) =>
     request<Message>('PATCH', `/channels/${channelId}/messages/${id}`, { content }),
   deleteMessage: (channelId: string, id: string) => request<void>('DELETE', `/channels/${channelId}/messages/${id}`),

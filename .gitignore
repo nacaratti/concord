@@ -3,3 +3,5 @@ web/dist/
 *.exe
 .env
 .env.*
+desktop/src-tauri/target/
+desktop/src-tauri/gen/

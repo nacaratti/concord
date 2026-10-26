@@ -1,13 +1,15 @@
 # Concord
 
-Plataforma de comunicação para um grupo pequeno de amigos: texto em tempo real hoje, voz e tela nas próximas fases.
+Plataforma de comunicação para um grupo pequeno de amigos: texto em tempo real, voz, compartilhamento de tela,
+anexos e um app desktop leve.
 Segue o plano em [Concord — Plano do Projeto](https://claude.ai/artifact/HccwfR8DZjjkgVYx1212Ay) e reproduz, em escala
 menor, os três planos do Discord: **consultas** (REST), **tempo real** (gateway WebSocket) e **mídia** (WebRTC, Fase 3).
 
 ```
 server/   Go: API REST + gateway WebSocket (net/http, coder/websocket, pgx)
 web/      React + TypeScript + Vite, Zustand para estado
-infra/    Docker Compose: PostgreSQL 17, Redis e LiveKit (SFU de voz)
+infra/    Docker Compose: PostgreSQL 17, Redis, LiveKit (SFU de voz) e RustFS (arquivos, S3)
+desktop/  App desktop em Tauri 2 (Rust): bandeja, notificações, push-to-talk global
 ```
 
 ## Rodando em desenvolvimento
@@ -96,6 +98,52 @@ no firewall e sirva o sinal por `wss://` (via Caddy) com `LIVEKIT_PUBLIC_URL`. T
 `LIVEKIT_API_SECRET` (o servidor Go e o Compose leem as mesmas variáveis) e aponte `LIVEKIT_WEBHOOK_URL` para
 `/api/livekit/webhook`.
 
+## Tela, anexos e app desktop (Fase 4)
+
+**Compartilhamento de tela.** O botão de tela no painel "Voz conectada" compartilha uma janela ou a tela inteira, com
+o áudio do jogo (no Chrome/Edge, marque "Compartilhar áudio" na janela de escolha). Sai em 1080p30 com simulcast em
+360p e 720p: o LiveKit manda a camada que cabe no player e na internet de quem assiste. Quem está fora da call vê o
+selo **AO VIVO** pelo gateway (`self_stream` no `VOICE_STATE_UPDATE`); quem está na call clica nele para assistir.
+Como no Discord, a tela só é baixada por quem clica para assistir.
+
+**Anexos.** Botão de clipe, colar (Ctrl+V) ou arrastar para o chat; até 10 arquivos de 25 MB por mensagem.
+
+1. O cliente pede `POST /api/channels/{id}/attachments` e recebe uma URL pré-assinada (15 min).
+2. O navegador envia o arquivo **direto ao armazenamento S3**, com barra de progresso; o servidor Go não carrega o arquivo.
+3. Ao enviar a mensagem com `attachment_ids`, o servidor confere que o envio é do autor e do canal e ainda não foi usado,
+   lê o arquivo para descobrir o tamanho e o tipo **reais** (não o que o cliente disse) e, se for imagem, gera a
+   miniatura (até 400×300, JPEG ou PNG se tiver transparência).
+4. Os arquivos são servidos pelo armazenamento, em outra origem; quem não é imagem é servido como download
+   (`Content-Disposition: attachment`) e texto/HTML como `text/plain`, então nada enviado roda como página.
+
+O plano previa MinIO, mas a imagem oficial saiu do Docker Hub em 2025; o Compose usa o **RustFS**, que fala a mesma
+API S3. O servidor usa só a API S3 padrão, então dá para trocar por Cloudflare R2 ou AWS S3 mudando `S3_ENDPOINT`,
+`S3_PUBLIC_ENDPOINT`, `S3_PUBLIC_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET` e `S3_SECURE=1`. O console do
+RustFS fica em http://localhost:9001 em desenvolvimento.
+
+**App desktop (`desktop/`).** Uma casca Tauri 2 que abre o Concord hospedado, como o app do Discord. Usa o WebView2
+do Windows em vez de embutir um Chromium inteiro. O lado nativo traz:
+
+- **Bandeja:** fechar a janela só esconde; o Concord segue na call e recebendo menções. Clique no ícone para voltar.
+- **Notificações do sistema** quando alguém te menciona e você não está olhando o canal (no navegador, ative em
+  menu do usuário → "Ativar notificações de menção").
+- **Push-to-talk global** (padrão F8): funciona com o jogo em foco. Ligue em "Push-to-talk" no painel de voz. No
+  navegador o mesmo botão funciona, mas só com a aba em foco.
+- Links externos (anexos, sites) abrem no navegador do sistema; a página só ganha acesso às APIs nativas na origem
+  configurada.
+
+```bash
+npm --prefix desktop install
+```
+
+```bash
+npm --prefix desktop run dev
+```
+
+O endereço vem de `CONCORD_URL` (padrão http://localhost:5173) e a tecla de `CONCORD_PTT_KEY`; ou de um
+`config.json` com `{"url": "...", "ptt_key": "F8"}` em `%APPDATA%\dev.concord.desktop\`. O instalador sai com
+`npm --prefix desktop run build` (precisa de Rust e das Build Tools do Visual Studio).
+
 ## Protocolo do gateway
 
 Envelope `{op, t, s, d}`, como no Discord. Opcodes: 0 DISPATCH, 1 HEARTBEAT, 2 IDENTIFY, 3 PRESENCE,
@@ -108,6 +156,7 @@ Para várias instâncias, troca-se por pub/sub do Redis sem mexer na API.
 
 ## Próximos passos
 
-- Fase 3 (resto): push-to-talk global (precisa do app desktop), supressão de ruído mais forte com RNNoise
-- Fase 4: tela, uploads via MinIO, app Tauri
+- Fase 3 (resto): supressão de ruído mais forte com RNNoise
+- Fase 4 (resto): apagar os arquivos do armazenamento quando a mensagem é apagada, e limpar envios autorizados que
+  nunca entraram numa mensagem
 - Fase 5: Prometheus/Grafana, k6, protocolo binário

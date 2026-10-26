@@ -3,6 +3,7 @@ import { api, ApiError, getToken, setToken } from './api'
 import { Gateway, type ConnectionState } from './gateway'
 import { VoiceClient, type VoiceStatus } from './voice'
 import {
+  type Attachment,
   CHANNEL_TEXT,
   type Channel,
   type Guild,
@@ -51,6 +52,16 @@ export interface MyVoice {
   selfDeaf: boolean
   micError: string | null
   quality: string
+  /** Estou compartilhando a minha tela. */
+  sharing: boolean
+  shareError: string | null
+  /** Quem está compartilhando a tela nesta call (visto pelo LiveKit, inclui você). */
+  screens: string[]
+  /** De quem é a tela que estou assistindo agora. */
+  watching: string | null
+  /** Push-to-talk ligado: o microfone só transmite enquanto a tecla está apertada. */
+  pttMode: boolean
+  pttHeld: boolean
 }
 
 interface Actions {
@@ -59,7 +70,7 @@ interface Actions {
   selectGuild: (id: string) => void
   selectChannel: (guildId: string, channelId: string) => void
   loadMessages: (channelId: string, older?: boolean) => Promise<void>
-  sendMessage: (channelId: string, content: string) => Promise<void>
+  sendMessage: (channelId: string, content: string, attachments?: Attachment[]) => Promise<void>
   retryMessage: (channelId: string, nonce: string) => void
   discardMessage: (channelId: string, nonce: string) => void
   setPresence: (status: Presence['status'], activity: string) => void
@@ -68,10 +79,37 @@ interface Actions {
   leaveVoice: () => void
   toggleMute: () => void
   toggleDeaf: () => void
+  toggleShare: () => Promise<void>
+  watchStream: (userId: string | null) => void
+  /** Liga o <video> à tela de alguém; devolve a função que desliga. */
+  attachStream: (userId: string, el: HTMLVideoElement) => () => void
   setUserVolume: (userId: string, volume: number) => void
+  togglePtt: () => void
+  enableNotifications: () => Promise<void>
 }
 
 const VOLUMES_KEY = 'concord.volumes'
+const PTT_KEY_STORAGE = 'concord.ptt'
+
+function loadFlag(key: string): boolean {
+  try {
+    return localStorage.getItem(key) === '1'
+  } catch {
+    return false
+  }
+}
+
+declare global {
+  interface Window {
+    /** Definido pelo app desktop (desktop/src-tauri/src/lib.rs). */
+    __CONCORD_DESKTOP__?: { pttKey: string }
+    __TAURI__?: { event: { listen: (name: string, cb: (e: { payload: unknown }) => void) => Promise<() => void> } }
+  }
+}
+
+/** A tecla do push-to-talk: a do app desktop, ou F8 no navegador. */
+export const pttKey = window.__CONCORD_DESKTOP__?.pttKey ?? 'F8'
+export const isDesktop = !!window.__CONCORD_DESKTOP__
 
 function loadVolumes(): Record<string, number> {
   try {
@@ -90,6 +128,12 @@ const idleVoice: MyVoice = {
   selfDeaf: false,
   micError: null,
   quality: 'unknown',
+  sharing: false,
+  shareError: null,
+  screens: [],
+  watching: null,
+  pttMode: loadFlag(PTT_KEY_STORAGE),
+  pttHeld: false,
 }
 
 let gateway: Gateway | null = null
@@ -177,6 +221,17 @@ export const useStore = create<State & Actions>()((set, get) => {
     onSpeaking: (speaking) => setVoice({ speaking }),
     onQuality: (quality) => setVoice({ quality }),
     onMicError: (micError) => setVoice({ micError }),
+    onScreens: (screens) => {
+      const v = get().voice
+      setVoice({ screens, watching: v.watching && screens.includes(v.watching) ? v.watching : null })
+    },
+    onSharing: (sharing) => {
+      const v = get().voice
+      if (v.sharing === sharing) return
+      setVoice({ sharing })
+      // O gateway avisa todos (inclusive quem está fora da call) que estou "ao vivo".
+      if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, v.selfMute, v.selfDeaf, sharing)
+    },
   })
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -209,7 +264,7 @@ export const useStore = create<State & Actions>()((set, get) => {
         if (status !== 'online' || get().myActivity) gateway?.updatePresence(status, get().myActivity)
         // Sessão nova enquanto eu estava em call: registra a call de novo nesta sessão.
         const v = get().voice
-        if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, v.selfMute, v.selfDeaf)
+        if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, v.selfMute, v.selfDeaf, v.sharing)
         const g = get().selectedGuild
         const ch = g ? get().selectedChannel[g] : undefined
         if (ch) void get().loadMessages(ch)
@@ -241,7 +296,7 @@ export const useStore = create<State & Actions>()((set, get) => {
           const kicked = !vs.channel_id && vs.session_id === gateway?.session && vs.guild_id === v.guildId
           if (movedToOtherTab || kicked) {
             void voiceClient.disconnect()
-            set({ voice: { ...idleVoice, selfMute: v.selfMute, selfDeaf: v.selfDeaf } })
+            set({ voice: { ...idleVoice, selfMute: v.selfMute, selfDeaf: v.selfDeaf, pttMode: v.pttMode } })
           }
         }
         break
@@ -250,7 +305,7 @@ export const useStore = create<State & Actions>()((set, get) => {
         const v = get().voice
         if (v.channelId !== d.channel_id) return
         voiceClient
-          .connect(d.endpoint, d.token, v.selfMute, v.selfDeaf, get().userVolumes)
+          .connect(d.endpoint, d.token, micMuted(v), v.selfDeaf, get().userVolumes)
           .catch(() => set({ voice: { ...get().voice, status: 'idle', micError: 'Não foi possível conectar à voz' } }))
         break
       }
@@ -299,6 +354,7 @@ export const useStore = create<State & Actions>()((set, get) => {
         } else if (mentionsMe(m.content, s.me)) {
           const rs = get().readStates[m.channel_id] ?? { channel_id: m.channel_id, last_read_id: '0', mention_count: 0 }
           set({ readStates: { ...get().readStates, [m.channel_id]: { ...rs, mention_count: rs.mention_count + 1 } } })
+          notifyMention(m)
         }
         break
       }
@@ -344,6 +400,44 @@ export const useStore = create<State & Actions>()((set, get) => {
 
   if (initial.token) queueMicrotask(() => startGateway(initial.token!))
 
+  /** Microfone fechado se mutado, surdo, ou em push-to-talk com a tecla solta. */
+  function micMuted(v: MyVoice): boolean {
+    return v.selfMute || v.selfDeaf || (v.pttMode && !v.pttHeld)
+  }
+
+  function setPttHeld(held: boolean) {
+    const v = get().voice
+    if (!v.pttMode || v.pttHeld === held) return
+    setVoice({ pttHeld: held })
+    if (v.channelId) void voiceClient.setMuted(micMuted(get().voice))
+  }
+
+  // No app desktop a tecla vem do atalho global (funciona com o jogo em foco). No navegador,
+  // só dá para ouvir o teclado com a aba em foco, mas já serve para testar.
+  if (window.__TAURI__ && isDesktop) {
+    void window.__TAURI__.event.listen('ptt', (e) => setPttHeld(e.payload === true))
+  } else {
+    window.addEventListener('keydown', (e) => e.key === pttKey && !e.repeat && setPttHeld(true))
+    window.addEventListener('keyup', (e) => e.key === pttKey && setPttHeld(false))
+    window.addEventListener('blur', () => setPttHeld(false))
+  }
+
+  /** Notificação do sistema quando alguém te menciona e você não está olhando o canal. */
+  function notifyMention(m: Message) {
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
+    const g = get().guilds[m.guild_id]
+    const ch = g?.channels.find((c) => c.id === m.channel_id)
+    const body = m.content || (m.attachments?.length ? `[${m.attachments.length} anexo(s)]` : '')
+    const n = new Notification(`${m.author.display_name} em #${ch?.name ?? 'canal'} (${g?.name ?? 'Concord'})`, {
+      body: body.slice(0, 200),
+      tag: m.channel_id, // várias menções no mesmo canal substituem a anterior
+    })
+    n.onclick = () => {
+      window.focus()
+      get().selectChannel(m.guild_id, m.channel_id)
+    }
+  }
+
   function findChannel(channelId: string): Channel | undefined {
     for (const g of Object.values(get().guilds)) {
       const c = g.channels.find((x) => x.id === channelId)
@@ -385,7 +479,7 @@ export const useStore = create<State & Actions>()((set, get) => {
 
   async function deliver(channelId: string, msg: Message, attempt = 0) {
     try {
-      const real = await api.sendMessage(channelId, msg.content, msg.nonce!)
+      const real = await api.sendMessage(channelId, msg.content, msg.nonce!, msg.attachments.map((a) => a.id))
       const list = get().messages[channelId] ?? []
       set({ messages: { ...get().messages, [channelId]: upsert(list, { ...real, nonce: msg.nonce }) } })
     } catch (err) {
@@ -456,7 +550,7 @@ export const useStore = create<State & Actions>()((set, get) => {
       }
     },
 
-    async sendMessage(channelId, content) {
+    async sendMessage(channelId, content, attachments = []) {
       const me = get().me!
       const ch = Object.values(get().guilds)
         .flatMap((g) => g.channels)
@@ -469,6 +563,8 @@ export const useStore = create<State & Actions>()((set, get) => {
         guild_id: ch?.guild_id ?? '',
         author: me,
         content,
+        // Na versão otimista os links apontam para a prévia local; a mensagem real traz os do S3.
+        attachments,
         edited_at: null,
         timestamp: new Date().toISOString(),
         nonce: n,
@@ -514,7 +610,7 @@ export const useStore = create<State & Actions>()((set, get) => {
       const v = get().voice
       if (v.guildId) gateway?.updateVoiceState(v.guildId, null, v.selfMute, v.selfDeaf)
       void voiceClient.disconnect()
-      set({ voice: { ...idleVoice, selfMute: v.selfMute, selfDeaf: v.selfDeaf } })
+      set({ voice: { ...idleVoice, selfMute: v.selfMute, selfDeaf: v.selfDeaf, pttMode: v.pttMode } })
     },
 
     toggleMute() {
@@ -523,9 +619,9 @@ export const useStore = create<State & Actions>()((set, get) => {
       // Como no Discord: desmutar enquanto surdo também tira o surdo.
       const selfDeaf = selfMute ? v.selfDeaf : false
       setVoice({ selfMute, selfDeaf })
-      void voiceClient.setMuted(selfMute)
+      void voiceClient.setMuted(micMuted(get().voice))
       voiceClient.setDeafened(selfDeaf)
-      if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, selfMute, selfDeaf)
+      if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, selfMute, selfDeaf, v.sharing)
     },
 
     toggleDeaf() {
@@ -534,8 +630,41 @@ export const useStore = create<State & Actions>()((set, get) => {
       const selfMute = selfDeaf
       setVoice({ selfMute, selfDeaf })
       voiceClient.setDeafened(selfDeaf)
-      void voiceClient.setMuted(selfMute)
-      if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, selfMute, selfDeaf)
+      void voiceClient.setMuted(micMuted(get().voice))
+      if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, selfMute, selfDeaf, v.sharing)
+    },
+
+    async toggleShare() {
+      const v = get().voice
+      setVoice({ shareError: null })
+      const err = await voiceClient.setSharing(!v.sharing)
+      if (err) setVoice({ shareError: err })
+      else if (!v.sharing) setVoice({ watching: get().me?.id ?? null }) // mostra a prévia da própria tela
+    },
+
+    watchStream(userId) {
+      setVoice({ watching: userId })
+    },
+
+    attachStream(userId, el) {
+      return voiceClient.watch(userId, el)
+    },
+
+    togglePtt() {
+      const pttMode = !get().voice.pttMode
+      setVoice({ pttMode, pttHeld: false })
+      try {
+        localStorage.setItem(PTT_KEY_STORAGE, pttMode ? '1' : '0')
+      } catch {
+        /* sem armazenamento: vale só nesta sessão */
+      }
+      if (get().voice.channelId) void voiceClient.setMuted(micMuted(get().voice))
+    },
+
+    async enableNotifications() {
+      if (typeof Notification === 'undefined') return
+      await Notification.requestPermission()
+      set({}) // força a interface a reler Notification.permission
     },
 
     setUserVolume(userId, volume) {
