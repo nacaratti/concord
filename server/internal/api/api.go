@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
 	"concord/internal/store"
+	"concord/internal/voice"
 )
 
 type ID = snowflake.ID
@@ -28,6 +30,7 @@ type API struct {
 	Hub     *gateway.Hub
 	IDs     *snowflake.Generator
 	Limiter *ratelimit.Limiter
+	Voice   *voice.Config
 	Log     *slog.Logger
 	// TrustProxy faz o IP do cliente vir de X-Forwarded-For (ligue só atrás do Caddy).
 	TrustProxy bool
@@ -54,7 +57,37 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("DELETE /api/channels/{channel}/messages/{message}", a.authed(a.deleteMessage))
 	mux.HandleFunc("POST /api/channels/{channel}/messages/{message}/ack", a.authed(a.ack))
 	mux.HandleFunc("POST /api/channels/{channel}/typing", a.authed(a.typing))
+	mux.HandleFunc("POST /api/livekit/webhook", a.livekitWebhook)
 	return mux
+}
+
+// livekitWebhook recebe os eventos do LiveKit. Usa só participant_left, para tirar da call
+// quem caiu sem avisar (aba fechada, internet caiu) em segundos em vez de esperar a sessão expirar.
+func (a *API) livekitWebhook(w http.ResponseWriter, r *http.Request) {
+	if a.Voice == nil {
+		http.NotFound(w, r)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		a.fail(w, errStatus(http.StatusBadRequest, "corpo inválido"))
+		return
+	}
+	ev, err := a.Voice.VerifyWebhook(r.Header.Get("Authorization"), body)
+	if err != nil {
+		a.fail(w, errStatus(http.StatusUnauthorized, "assinatura inválida"))
+		return
+	}
+	if ev.Event == "participant_left" {
+		uid, sid, ok := voice.ParseIdentity(ev.Participant.Identity)
+		chStr, isVoice := strings.CutPrefix(ev.Room.Name, "voice:")
+		userID, err1 := snowflake.Parse(uid)
+		channelID, err2 := snowflake.Parse(chStr)
+		if ok && isVoice && err1 == nil && err2 == nil {
+			a.Hub.ClearVoice(userID, sid, channelID)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // limited gasta uma ficha do balde; se acabou, responde 429 com retry_after (segundos) e devolve true.
@@ -301,7 +334,7 @@ func (a *API) guildPayload(g store.Guild) map[string]any {
 	for i, m := range g.Members {
 		ids[i] = m.User.ID
 	}
-	return map[string]any{"guild": g, "presences": a.Hub.Presences(ids)}
+	return map[string]any{"guild": g, "presences": a.Hub.Presences(ids), "voice_states": a.Hub.VoiceStates(g.ID)}
 }
 
 func (a *API) createGuild(w http.ResponseWriter, r *http.Request) {

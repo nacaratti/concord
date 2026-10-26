@@ -19,6 +19,15 @@ export interface Channel {
   last_message_id: Snowflake | null
 }
 
+export interface VoiceState {
+  guild_id: Snowflake
+  channel_id: Snowflake | null
+  user_id: Snowflake
+  session_id: string
+  self_mute: boolean
+  self_deaf: boolean
+}
+
 export interface ReadState {
   channel_id: Snowflake
   last_read_id: Snowflake

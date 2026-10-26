@@ -6,6 +6,7 @@ export const Op = {
   Heartbeat: 1,
   Identify: 2,
   Presence: 3,
+  VoiceStateUpdate: 4,
   Resume: 6,
   Reconnect: 7,
   InvalidSession: 9,
@@ -78,6 +79,15 @@ export class Gateway {
 
   updatePresence(status: string, activity: string) {
     this.send({ op: Op.Presence, d: { status, activity } })
+  }
+
+  /** Entra, troca, sai (channelId null) ou só muda mute/deafen numa call. */
+  updateVoiceState(guildId: string, channelId: string | null, selfMute: boolean, selfDeaf: boolean) {
+    this.send({ op: Op.VoiceStateUpdate, d: { guild_id: guildId, channel_id: channelId, self_mute: selfMute, self_deaf: selfDeaf } })
+  }
+
+  get session(): string | null {
+    return this.sessionId
   }
 
   /** Só para depuração: derruba o socket para ver o RESUME acontecer. */

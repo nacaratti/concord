@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { api, ApiError, getToken, setToken } from './api'
 import { Gateway, type ConnectionState } from './gateway'
+import { VoiceClient, type VoiceStatus } from './voice'
 import {
   CHANNEL_TEXT,
   type Channel,
@@ -10,6 +11,7 @@ import {
   type Presence,
   type ReadState,
   type User,
+  type VoiceState,
 } from './types'
 
 interface State {
@@ -32,6 +34,23 @@ interface State {
   selectedChannel: Record<string, string>
   myStatus: Presence['status']
   myActivity: string
+  /** Quem está em qual call, em todos os meus servidores (por usuário). */
+  voiceStates: Record<string, VoiceState>
+  /** A minha call. */
+  voice: MyVoice
+  /** Volume que escolhi para cada pessoa (0 a 2), guardado neste navegador. */
+  userVolumes: Record<string, number>
+}
+
+export interface MyVoice {
+  guildId: string | null
+  channelId: string | null
+  status: VoiceStatus
+  speaking: string[]
+  selfMute: boolean
+  selfDeaf: boolean
+  micError: string | null
+  quality: string
 }
 
 interface Actions {
@@ -45,6 +64,32 @@ interface Actions {
   discardMessage: (channelId: string, nonce: string) => void
   setPresence: (status: Presence['status'], activity: string) => void
   simulateDrop: () => void
+  joinVoice: (guildId: string, channelId: string) => void
+  leaveVoice: () => void
+  toggleMute: () => void
+  toggleDeaf: () => void
+  setUserVolume: (userId: string, volume: number) => void
+}
+
+const VOLUMES_KEY = 'concord.volumes'
+
+function loadVolumes(): Record<string, number> {
+  try {
+    return JSON.parse(localStorage.getItem(VOLUMES_KEY) ?? '{}')
+  } catch {
+    return {}
+  }
+}
+
+const idleVoice: MyVoice = {
+  guildId: null,
+  channelId: null,
+  status: 'idle',
+  speaking: [],
+  selfMute: false,
+  selfDeaf: false,
+  micError: null,
+  quality: 'unknown',
 }
 
 let gateway: Gateway | null = null
@@ -66,6 +111,9 @@ const initial: State = {
   selectedChannel: {},
   myStatus: 'online',
   myActivity: '',
+  voiceStates: {},
+  voice: idleVoice,
+  userVolumes: loadVolumes(),
 }
 
 function firstTextChannel(g: Guild): Channel | undefined {
@@ -116,7 +164,21 @@ function patchChannel(guilds: Record<string, Guild>, guildId: string, channelId:
 
 const ackTimers: Record<string, number> = {}
 
+function byUser(states: VoiceState[] | undefined): Record<string, VoiceState> {
+  const out: Record<string, VoiceState> = {}
+  for (const vs of states ?? []) out[vs.user_id] = vs
+  return out
+}
+
 export const useStore = create<State & Actions>()((set, get) => {
+  const setVoice = (patch: Partial<MyVoice>) => set({ voice: { ...get().voice, ...patch } })
+  const voiceClient = new VoiceClient({
+    onStatus: (status) => setVoice({ status }),
+    onSpeaking: (speaking) => setVoice({ speaking }),
+    onQuality: (quality) => setVoice({ quality }),
+    onMicError: (micError) => setVoice({ micError }),
+  })
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function onDispatch(t: string, d: any) {
     const s = get()
@@ -137,6 +199,7 @@ export const useStore = create<State & Actions>()((set, get) => {
           guildOrder: order,
           presences,
           readStates,
+          voiceStates: byUser(d.voice_states as VoiceState[]),
           messages: {},
           hasMore: {},
           typing: {},
@@ -144,6 +207,9 @@ export const useStore = create<State & Actions>()((set, get) => {
         })
         const status = get().myStatus
         if (status !== 'online' || get().myActivity) gateway?.updatePresence(status, get().myActivity)
+        // Sessão nova enquanto eu estava em call: registra a call de novo nesta sessão.
+        const v = get().voice
+        if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, v.selfMute, v.selfDeaf)
         const g = get().selectedGuild
         const ch = g ? get().selectedChannel[g] : undefined
         if (ch) void get().loadMessages(ch)
@@ -157,7 +223,35 @@ export const useStore = create<State & Actions>()((set, get) => {
           guilds: { ...s.guilds, [g.id]: g },
           guildOrder: s.guildOrder.includes(g.id) ? s.guildOrder : [...s.guildOrder, g.id],
           presences,
+          voiceStates: { ...s.voiceStates, ...byUser(d.voice_states as VoiceState[]) },
         })
+        break
+      }
+      case 'VOICE_STATE_UPDATE': {
+        const vs = d as VoiceState
+        const voiceStates = { ...s.voiceStates }
+        if (vs.channel_id) voiceStates[vs.user_id] = vs
+        else delete voiceStates[vs.user_id]
+        set({ voiceStates })
+        const v = get().voice
+        if (vs.user_id === s.me?.id && v.channelId) {
+          const movedToOtherTab = vs.channel_id && vs.session_id !== gateway?.session
+          // Saída da minha sessão neste mesmo servidor (ex.: o webhook do LiveKit me tirou). Uma saída
+          // de outro servidor é só eu trocando de servidor, e a entrada nova já está a caminho.
+          const kicked = !vs.channel_id && vs.session_id === gateway?.session && vs.guild_id === v.guildId
+          if (movedToOtherTab || kicked) {
+            void voiceClient.disconnect()
+            set({ voice: { ...idleVoice, selfMute: v.selfMute, selfDeaf: v.selfDeaf } })
+          }
+        }
+        break
+      }
+      case 'VOICE_SERVER_UPDATE': {
+        const v = get().voice
+        if (v.channelId !== d.channel_id) return
+        voiceClient
+          .connect(d.endpoint, d.token, v.selfMute, v.selfDeaf, get().userVolumes)
+          .catch(() => set({ voice: { ...get().voice, status: 'idle', micError: 'Não foi possível conectar à voz' } }))
         break
       }
       case 'GUILD_MEMBER_ADD': {
@@ -320,6 +414,7 @@ export const useStore = create<State & Actions>()((set, get) => {
     },
 
     async logout() {
+      get().leaveVoice()
       await api.logout().catch(() => {})
       gateway?.close()
       gateway = null
@@ -405,6 +500,53 @@ export const useStore = create<State & Actions>()((set, get) => {
 
     simulateDrop() {
       gateway?.simulateDrop()
+    },
+
+    joinVoice(guildId, channelId) {
+      const v = get().voice
+      if (v.channelId === channelId && v.status !== 'idle') return
+      // O pedido vai pelo gateway; o token chega de volta em VOICE_SERVER_UPDATE.
+      setVoice({ guildId, channelId, status: 'connecting', speaking: [], micError: null })
+      gateway?.updateVoiceState(guildId, channelId, v.selfMute, v.selfDeaf)
+    },
+
+    leaveVoice() {
+      const v = get().voice
+      if (v.guildId) gateway?.updateVoiceState(v.guildId, null, v.selfMute, v.selfDeaf)
+      void voiceClient.disconnect()
+      set({ voice: { ...idleVoice, selfMute: v.selfMute, selfDeaf: v.selfDeaf } })
+    },
+
+    toggleMute() {
+      const v = get().voice
+      const selfMute = !v.selfMute
+      // Como no Discord: desmutar enquanto surdo também tira o surdo.
+      const selfDeaf = selfMute ? v.selfDeaf : false
+      setVoice({ selfMute, selfDeaf })
+      void voiceClient.setMuted(selfMute)
+      voiceClient.setDeafened(selfDeaf)
+      if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, selfMute, selfDeaf)
+    },
+
+    toggleDeaf() {
+      const v = get().voice
+      const selfDeaf = !v.selfDeaf
+      const selfMute = selfDeaf
+      setVoice({ selfMute, selfDeaf })
+      voiceClient.setDeafened(selfDeaf)
+      void voiceClient.setMuted(selfMute)
+      if (v.guildId && v.channelId) gateway?.updateVoiceState(v.guildId, v.channelId, selfMute, selfDeaf)
+    },
+
+    setUserVolume(userId, volume) {
+      const userVolumes = { ...get().userVolumes, [userId]: volume }
+      set({ userVolumes })
+      voiceClient.setUserVolume(userId, volume)
+      try {
+        localStorage.setItem(VOLUMES_KEY, JSON.stringify(userVolumes))
+      } catch {
+        /* sem armazenamento: vale só nesta sessão */
+      }
     },
   }
 })

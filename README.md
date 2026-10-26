@@ -7,7 +7,7 @@ menor, os três planos do Discord: **consultas** (REST), **tempo real** (gateway
 ```
 server/   Go: API REST + gateway WebSocket (net/http, coder/websocket, pgx)
 web/      React + TypeScript + Vite, Zustand para estado
-infra/    Docker Compose: PostgreSQL 17 e Redis
+infra/    Docker Compose: PostgreSQL 17, Redis e LiveKit (SFU de voz)
 ```
 
 ## Rodando em desenvolvimento
@@ -68,17 +68,46 @@ docker exec concord-redis-1 redis-cli --scan --pattern "rl:*" | xargs docker exe
 
 O menu do usuário (canto inferior esquerdo) tem **Simular queda de conexão**, para ver o RESUME acontecendo no DevTools.
 
+## Voz (Fase 3)
+
+Cada pessoa manda um único fluxo de áudio ao LiveKit (SFU), que o repassa aos outros sem decodificar.
+O Concord decide **quem** está em qual call; o LiveKit só transporta a mídia.
+
+1. O cliente envia pelo gateway o op 4 `VOICE_STATE_UPDATE` com `guild_id`, `channel_id`, `self_mute` e `self_deaf`.
+2. O servidor confere se o canal é de voz e se a pessoa participa do servidor, guarda o estado em memória e
+   avisa todos com o evento `VOICE_STATE_UPDATE`.
+3. Só para a sessão que pediu, o servidor manda `VOICE_SERVER_UPDATE` com um token JWT do LiveKit (sala
+   `voice:<canal>`, identidade `<usuário>:<sessão>`, só microfone e tela). Mudar só mute/deafen não gera token novo.
+4. O navegador conecta direto ao LiveKit (WebRTC, Opus em perfil de voz com DTX e RED) e publica o microfone com
+   supressão de ruído, cancelamento de eco e ganho automático do navegador.
+5. Se alguém cai sem avisar, o webhook `participant_left` do LiveKit (assinado com o segredo da API) tira a pessoa
+   da call em segundos. O webhook de uma sessão antiga não derruba a nova.
+
+Na interface: clique no canal de voz para entrar; o painel "Voz conectada" mostra a qualidade da conexão e o botão
+de desligar; microfone e fone ficam ao lado do seu nome; clique em alguém na call para ajustar o volume dessa
+pessoa (0 a 200%, guardado no navegador). O anel verde de quem está falando é medido no próprio cliente com um
+`AnalyserNode`, porque o evento de falantes do LiveKit só avisa mudanças e quem entrasse numa call em andamento não
+veria quem já estava falando. Sem microfone (ou com a permissão negada), você entra só ouvindo.
+
+O `livekit-client` (~530 kB) só é baixado na primeira vez que alguém entra numa call.
+
+**Em produção**, o LiveKit precisa anunciar o IP público: defina `LIVEKIT_NODE_IP`, libere `7881/tcp` e `7882/udp`
+no firewall e sirva o sinal por `wss://` (via Caddy) com `LIVEKIT_PUBLIC_URL`. Troque também `LIVEKIT_API_KEY` e
+`LIVEKIT_API_SECRET` (o servidor Go e o Compose leem as mesmas variáveis) e aponte `LIVEKIT_WEBHOOK_URL` para
+`/api/livekit/webhook`.
+
 ## Protocolo do gateway
 
-Envelope `{op, t, s, d}`, como no Discord. Opcodes: 0 DISPATCH, 1 HEARTBEAT, 2 IDENTIFY, 3 PRESENCE, 6 RESUME,
+Envelope `{op, t, s, d}`, como no Discord. Opcodes: 0 DISPATCH, 1 HEARTBEAT, 2 IDENTIFY, 3 PRESENCE,
+4 VOICE_STATE_UPDATE, 6 RESUME,
 7 RECONNECT, 9 INVALID_SESSION, 10 HELLO, 11 HEARTBEAT_ACK. Eventos: `READY`, `RESUMED`, `GUILD_CREATE`,
-`GUILD_MEMBER_ADD`, `CHANNEL_CREATE`, `MESSAGE_CREATE/UPDATE/DELETE`, `MESSAGE_ACK`, `TYPING_START`, `PRESENCE_UPDATE`.
+`GUILD_MEMBER_ADD`, `CHANNEL_CREATE`, `MESSAGE_CREATE/UPDATE/DELETE`, `MESSAGE_ACK`, `TYPING_START`, `PRESENCE_UPDATE`, `VOICE_STATE_UPDATE`, `VOICE_SERVER_UPDATE`.
 
 O fan-out hoje é um mapa em memória (`guild → sessões`) em [server/internal/gateway](server/internal/gateway/gateway.go).
 Para várias instâncias, troca-se por pub/sub do Redis sem mexer na API.
 
 ## Próximos passos
 
-- Fase 3: LiveKit no Compose, tokens emitidos pelo backend, `VOICE_STATE_UPDATE`
+- Fase 3 (resto): push-to-talk global (precisa do app desktop), supressão de ruído mais forte com RNNoise
 - Fase 4: tela, uploads via MinIO, app Tauri
 - Fase 5: Prometheus/Grafana, k6, protocolo binário

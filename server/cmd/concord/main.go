@@ -18,6 +18,7 @@ import (
 	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
 	"concord/internal/store"
+	"concord/internal/voice"
 )
 
 func env(key, def string) string {
@@ -56,10 +57,15 @@ func main() {
 
 	origins := strings.Split(env("CONCORD_ORIGINS", "localhost:*,127.0.0.1:*"), ",")
 	hub := gateway.NewHub(st, log, origins)
-	hub.Limiter, hub.TrustProxy = limiter, trustProxy
+	vc := &voice.Config{
+		APIKey:    env("LIVEKIT_API_KEY", "concord-dev"),
+		APISecret: env("LIVEKIT_API_SECRET", "concord-dev-secret-troque-em-producao-0123456789"),
+		PublicURL: env("LIVEKIT_PUBLIC_URL", "ws://localhost:7880"),
+	}
+	hub.Limiter, hub.TrustProxy, hub.Voice = limiter, trustProxy, vc
 	go hub.Run(ctx)
 
-	a := &api.API{Store: st, Hub: hub, IDs: snowflake.NewGenerator(1), Limiter: limiter, Log: log, TrustProxy: trustProxy}
+	a := &api.API{Store: st, Hub: hub, IDs: snowflake.NewGenerator(1), Limiter: limiter, Voice: vc, Log: log, TrustProxy: trustProxy}
 	mux := http.NewServeMux()
 	mux.Handle("/api/", a.Routes())
 	mux.Handle("GET /gateway", hub)

@@ -4,6 +4,7 @@ import { isUnread, mentionCount, useStore } from '../store'
 import { CHANNEL_TEXT, CHANNEL_VOICE, type Invite, type Status } from '../types'
 import { Avatar, statusLabel } from './Avatar'
 import { Modal } from './Modal'
+import { VoiceChannel, VoiceControls, VoicePanel } from './Voice'
 
 function initials(name: string) {
   return name
@@ -174,16 +175,13 @@ export function ChannelSidebar() {
                       {mentionCount(c, readStates) > 0 && <span className="badge">{mentionCount(c, readStates)}</span>}
                     </button>
                   ) : (
-                    <div key={c.id} className="channel voice" title="Voz chega na Fase 3 (LiveKit)">
-                      <span className="hash">🔊</span>
-                      <span className="ellipsis">{c.name}</span>
-                      <span className="soon">em breve</span>
-                    </div>
+                    <VoiceChannel key={c.id} guild={g} channel={c} />
                   ),
                 )}
             </section>
           ))}
       </div>
+      <VoicePanel />
       <UserPanel />
       {inviting && g && <InviteModal guildId={g.id} guildName={g.name} onClose={() => setInviting(false)} />}
       {creatingKind !== null && g && (
@@ -285,6 +283,7 @@ function UserPanel() {
           <span className="ellipsis muted small">{myActivity ? `Jogando ${myActivity}` : statusLabel[myStatus]}</span>
         </div>
       </button>
+      <VoiceControls />
       <span className={`conn ${connection}`} title={`Gateway: ${connection}`} />
       {open && (
         <div className="popover">

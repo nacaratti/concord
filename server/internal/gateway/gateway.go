@@ -19,20 +19,22 @@ import (
 	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
 	"concord/internal/store"
+	"concord/internal/voice"
 )
 
 type ID = snowflake.ID
 
 const (
-	OpDispatch       = 0
-	OpHeartbeat      = 1
-	OpIdentify       = 2
-	OpPresence       = 3
-	OpResume         = 6
-	OpReconnect      = 7
-	OpInvalidSession = 9
-	OpHello          = 10
-	OpHeartbeatAck   = 11
+	OpDispatch         = 0
+	OpHeartbeat        = 1
+	OpIdentify         = 2
+	OpPresence         = 3
+	OpVoiceStateUpdate = 4
+	OpResume           = 6
+	OpReconnect        = 7
+	OpInvalidSession   = 9
+	OpHello            = 10
+	OpHeartbeatAck     = 11
 )
 
 const (
@@ -129,6 +131,7 @@ type bufferedEvent struct {
 type Session struct {
 	ID     string
 	UserID ID
+	Name   string // nome de exibição, mostrado aos outros na call
 
 	mu         sync.Mutex
 	seq        int64
@@ -163,21 +166,25 @@ type Hub struct {
 	// Limiter, quando definido, limita conexões novas por IP.
 	Limiter    *ratelimit.Limiter
 	TrustProxy bool
+	// Voice, quando definido, permite entrar em canais de voz (tokens do LiveKit).
+	Voice *voice.Config
 
-	mu        sync.Mutex
-	sessions  map[string]*Session
-	byUser    map[ID]map[*Session]struct{}
-	byGuild   map[ID]map[*Session]struct{}
-	presences map[ID]Presence
+	mu          sync.Mutex
+	sessions    map[string]*Session
+	byUser      map[ID]map[*Session]struct{}
+	byGuild     map[ID]map[*Session]struct{}
+	presences   map[ID]Presence
+	voiceStates map[ID]VoiceState // por usuário: cada um está em no máximo uma call
 }
 
 func NewHub(st *store.Store, log *slog.Logger, origins []string) *Hub {
 	return &Hub{
 		store: st, log: log, origins: origins,
-		sessions:  map[string]*Session{},
-		byUser:    map[ID]map[*Session]struct{}{},
-		byGuild:   map[ID]map[*Session]struct{}{},
-		presences: map[ID]Presence{},
+		sessions:    map[string]*Session{},
+		byUser:      map[ID]map[*Session]struct{}{},
+		byGuild:     map[ID]map[*Session]struct{}{},
+		presences:   map[ID]Presence{},
+		voiceStates: map[ID]VoiceState{},
 	}
 }
 
@@ -198,6 +205,7 @@ func (h *Hub) Run(ctx context.Context) {
 func (h *Hub) reap() {
 	var offline []Presence
 	var offlineGuilds [][]ID
+	var voiceLeft []VoiceState
 	h.mu.Lock()
 	for id, s := range h.sessions {
 		s.mu.Lock()
@@ -207,6 +215,9 @@ func (h *Hub) reap() {
 			continue
 		}
 		delete(h.sessions, id)
+		if vs, ok := h.clearVoiceForSessionLocked(s); ok {
+			voiceLeft = append(voiceLeft, vs)
+		}
 		for g := range s.guilds {
 			delete(h.byGuild[g], s)
 		}
@@ -219,6 +230,9 @@ func (h *Hub) reap() {
 		}
 	}
 	h.mu.Unlock()
+	for _, vs := range voiceLeft {
+		h.DispatchGuild(vs.GuildID, "VOICE_STATE_UPDATE", vs)
+	}
 	for i, p := range offline {
 		h.DispatchGuilds(offlineGuilds[i], "PRESENCE_UPDATE", p)
 	}
@@ -354,6 +368,8 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			c.send(frame(OpHeartbeatAck, "", 0, nil))
 		case OpPresence:
 			h.handlePresence(sess, f.D)
+		case OpVoiceStateUpdate:
+			h.handleVoiceState(ctx, sess, f.D)
 		default:
 			c.close(CloseUnknownOpcode, "opcode desconhecido")
 			return
@@ -442,7 +458,7 @@ func (h *Hub) identify(ctx context.Context, c *conn, user store.User) (*Session,
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{ID: newSessionID(), UserID: user.ID, guilds: map[ID]struct{}{}, conn: c}
+	s := &Session{ID: newSessionID(), UserID: user.ID, Name: user.DisplayName, guilds: map[ID]struct{}{}, conn: c}
 
 	h.mu.Lock()
 	h.sessions[s.ID] = s
@@ -467,11 +483,12 @@ func (h *Hub) identify(ctx context.Context, c *conn, user store.User) (*Session,
 	}
 	// READY sai como seq 1, antes que qualquer outro evento alcance esta sessão.
 	s.dispatch("READY", raw(map[string]any{
-		"session_id":  s.ID,
-		"user":        user,
-		"guilds":      guilds,
-		"presences":   h.presencesLocked(memberIDs),
-		"read_states": readStates,
+		"session_id":   s.ID,
+		"user":         user,
+		"guilds":       guilds,
+		"presences":    h.presencesLocked(memberIDs),
+		"read_states":  readStates,
+		"voice_states": h.voiceStatesLocked(keys(s.guilds)),
 	}))
 	me := h.presences[user.ID]
 	h.mu.Unlock()
