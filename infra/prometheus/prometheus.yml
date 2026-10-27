@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 5s # curto de propósito: dá para ver o teste de carga acontecendo quase em tempo real
+
+scrape_configs:
+  # O servidor Go. Em desenvolvimento ele roda fora do Docker (go run), por isso host.docker.internal.
+  # Rodando o servidor no Compose (`--profile full`), troque o alvo por server:9091.
+  - job_name: concord
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+
+  - job_name: livekit
+    static_configs:
+      - targets: ["livekit:6789"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

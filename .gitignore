@@ -5,3 +5,4 @@ web/dist/
 .env.*
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
+infra/backups/

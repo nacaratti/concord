@@ -115,9 +115,9 @@ func (h *Hub) handleVoiceState(ctx context.Context, s *Session, d json.RawMessag
 			return
 		}
 		// Só esta sessão recebe o token: é a credencial para entrar na sala.
-		s.dispatch("VOICE_SERVER_UPDATE", raw(map[string]any{
+		s.dispatchNow("VOICE_SERVER_UPDATE", map[string]any{
 			"guild_id": in.GuildID, "channel_id": in.ChannelID, "token": token, "endpoint": h.Voice.PublicURL,
-		}))
+		})
 	}
 }
 

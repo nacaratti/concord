@@ -1,0 +1,12 @@
+{
+  "name": "concord-loadtest",
+  "private": true,
+  "description": "Teste de compressão do gateway com clientes que negociam permessage-deflate com contexto, como os navegadores",
+  "type": "module",
+  "scripts": {
+    "compression": "node compression.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}

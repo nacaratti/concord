@@ -8,7 +8,8 @@ menor, os três planos do Discord: **consultas** (REST), **tempo real** (gateway
 ```
 server/   Go: API REST + gateway WebSocket (net/http, coder/websocket, pgx)
 web/      React + TypeScript + Vite, Zustand para estado
-infra/    Docker Compose: PostgreSQL 17, Redis, LiveKit (SFU de voz) e RustFS (arquivos, S3)
+infra/    Docker Compose: PostgreSQL 17 (com backup automático), Redis, LiveKit (SFU de voz), RustFS (arquivos, S3),
+          Prometheus + Grafana e testes de carga (k6 e Node)
 desktop/  App desktop em Tauri 2 (Rust): bandeja, notificações, push-to-talk global
 ```
 
@@ -32,8 +33,9 @@ Abra http://localhost:5173. O Vite repassa `/api` e `/gateway` para o servidor e
 O Postgres do Compose fica na porta **5433** e o Redis na **6380** do host, para não colidir com outros projetos.
 
 Variáveis do servidor: `DATABASE_URL`, `REDIS_URL` (padrão `redis://localhost:6380/0`), `CONCORD_ADDR` (padrão `:8080`), `CONCORD_ORIGINS` (origens aceitas no
-WebSocket, padrão `localhost:*,127.0.0.1:*`) e `CONCORD_WEB_DIR` (pasta do build do `web/` para servir tudo de um só
-processo).
+WebSocket, padrão `localhost:*,127.0.0.1:*`), `CONCORD_WEB_DIR` (pasta do build do `web/` para servir tudo de um só
+processo), `CONCORD_METRICS_ADDR` (padrão `:9091`, **não exponha na internet**), `CONCORD_WS_COMPRESSION`
+(`context`, `nocontext` ou `off`; padrão `context`, ver Fase 5) e `CONCORD_RATELIMIT=off` (só para teste de carga).
 
 ## O que já funciona (Fases 0, 1 e 2)
 
@@ -144,6 +146,91 @@ O endereço vem de `CONCORD_URL` (padrão http://localhost:5173) e a tecla de `C
 `config.json` com `{"url": "...", "ptt_key": "F8"}` em `%APPDATA%\dev.concord.desktop\`. O instalador sai com
 `npm --prefix desktop run build` (precisa de Rust e das Build Tools do Visual Studio).
 
+## Observabilidade e desempenho (Fase 5)
+
+**Backup.** O serviço `backup` faz `pg_dump -Fc` ao subir e a cada 6 h e guarda 7 dias em `infra/backups/`
+(`BACKUP_INTERVAL_HOURS`, `BACKUP_KEEP_DAYS`). Para restaurar (num banco à parte, para conferir antes):
+
+```bash
+docker compose -f infra/docker-compose.yml run --rm backup restore.sh backups/concord-AAAAMMDDTHHMMSSZ.dump concord_restore
+```
+
+Sem o último argumento, restaura em cima do banco `concord`. Em produção, copie `infra/backups/` para fora do
+servidor: backup no mesmo disco não salva de disco perdido.
+
+**Métricas.** O servidor expõe `/metrics` na porta `:9091`: sessões do gateway (conectadas e retomáveis), eventos
+e bytes enviados por codificação, **tempo de fan-out** (da publicação até a escrita no socket de cada destinatário),
+duração das requisições HTTP por rota, recusas do rate limit, conexões derrubadas por lentidão, conexões do banco,
+além de memória, goroutines e GC do Go. O LiveKit publica salas, participantes e latência de encaminhamento.
+
+```bash
+docker compose -f infra/docker-compose.yml --profile metrics up -d
+```
+
+Grafana em http://localhost:3001 (o painel **Concord** abre direto; login `admin` / `concord` para editar),
+Prometheus em http://localhost:9090. O painel é gerado por `infra/grafana/make_dashboard.py`; depois de rodar o
+script, reinicie o Grafana para ele reler o arquivo.
+
+**Protocolo binário: medido antes de decidido.** `CONCORD_BANDWIDTH=1 go -C server test -run Bandwidth -v
+./internal/gateway` codifica um READY real e 2.000 eventos (70% mensagens, 20% digitando, 10% presença) em cada
+combinação:
+
+| codificação | transporte | bytes/evento | CPU/evento | memória fixa/conexão |
+|---|---|---:|---:|---:|
+| JSON | sem compressão | 314 | 1 µs | ~0 |
+| MessagePack | sem compressão | 263 (−16%) | 8,3 µs | ~0 |
+| JSON | permessage-deflate sem contexto | 314 | 1,1 µs | ~0 |
+| **JSON** | **permessage-deflate com contexto** | **54 (−83%)** | 5,2 µs | ~0,8 MB |
+| MessagePack | permessage-deflate com contexto | 57 | 12,1 µs | ~0,8 MB |
+| JSON | zstd-stream (como o Discord) | 50 | 5,2 µs | ~0,5 MB |
+
+Com compressão, o MessagePack fica *maior* que o JSON (a compressão já some com a repetição do texto, e o binário
+comprime pior) e gasta mais CPU. A compressão sem contexto não ajuda os eventos, que ficam abaixo dos 512 bytes a
+partir dos quais ela age. Por isso o padrão é **JSON + permessage-deflate com contexto**, que o navegador negocia
+sozinho, sem código no cliente. O MessagePack existe como opção experimental (`/gateway?encoding=msgpack`, ou no
+menu do usuário → "Protocolo"), ponta a ponta, para quem quiser comparar; o cliente sempre envia JSON, e o
+decodificador só é baixado por quem liga a opção.
+
+**Teste de carga.** Suba o servidor com `CONCORD_RATELIMIT=off` e rode, de `infra/`:
+
+```bash
+docker compose --profile loadtest run --rm k6 run /scripts/gateway.js
+```
+
+São 1.000 conexões (HELLO → IDENTIFY → heartbeat, como o cliente) num mesmo servidor, enquanto chegam 5 mensagens
+por segundo — 5.000 entregas por segundo. Cada conexão mede a entrega de ponta a ponta (POST, banco, fan-out, rede).
+Resultado nesta máquina (Windows, Docker Desktop):
+
+| | resultado | meta |
+|---|---:|---:|
+| entregas | 300.000 de 300.000 | |
+| entrega de ponta a ponta p95 | **51 ms** (média 32 ms) | < 100 ms |
+| fan-out no servidor p95 / p99 | 11 / 22 ms | |
+| READY p95 | 9 ms | < 1 s |
+| conexões derrubadas por lentidão | 0 | |
+
+O k6 só negocia compressão *sem* contexto, então ele não mostra o custo da compressão dos navegadores. Para isso há
+`infra/loadtest/compression.mjs` (Node + `ws`, que negocia com contexto como o Chrome e o Firefox):
+
+```bash
+npm --prefix infra/loadtest install
+```
+
+```bash
+node infra/loadtest/compression.mjs --compress
+```
+
+Com 1.000 conexões e 150.000 entregas, cada modo num servidor recém-iniciado:
+
+| | bytes no fio/entrega | entrega p50 / p95 / p99 | heap no pico |
+|---|---:|---:|---:|
+| sem compressão | 428 | 16 / 30 / 37 ms | 244 MB |
+| com contexto | **56** | 27 / 39 / 47 ms | **1.181 MB** (~1,1 MB por conexão) |
+
+Na escala do Concord (dezenas de pessoas, ~100 conexões contando abas) a compressão custa ~110 MB e corta quase 90%
+da banda de cada um, o que pesa no celular. Acima de poucas centenas de conexões, ou numa VPS pequena, use
+`CONCORD_WS_COMPRESSION=nocontext` (o READY continua comprimido) ou `off`.
+
 ## Protocolo do gateway
 
 Envelope `{op, t, s, d}`, como no Discord. Opcodes: 0 DISPATCH, 1 HEARTBEAT, 2 IDENTIFY, 3 PRESENCE,
@@ -159,4 +246,5 @@ Para várias instâncias, troca-se por pub/sub do Redis sem mexer na API.
 - Fase 3 (resto): supressão de ruído mais forte com RNNoise
 - Fase 4 (resto): apagar os arquivos do armazenamento quando a mensagem é apagada, e limpar envios autorizados que
   nunca entraram numa mensagem
-- Fase 5: Prometheus/Grafana, k6, protocolo binário
+- Fase 5 (resto): alertas no Grafana (entrega p95 > 100 ms, conexões lentas) e cópia do backup para fora do servidor
+- Produção: Caddy com HTTPS, LiveKit com IP público e portas de voz abertas, numa VPS em São Paulo

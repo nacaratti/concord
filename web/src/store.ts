@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { api, ApiError, getToken, setToken } from './api'
-import { Gateway, type ConnectionState } from './gateway'
+import { Gateway, type ConnectionState, type Encoding } from './gateway'
 import { VoiceClient, type VoiceStatus } from './voice'
 import {
   type Attachment,
@@ -41,6 +41,8 @@ interface State {
   voice: MyVoice
   /** Volume que escolhi para cada pessoa (0 a 2), guardado neste navegador. */
   userVolumes: Record<string, number>
+  /** Codificação do gateway: JSON (padrão) ou MessagePack (experimental). */
+  encoding: Encoding
 }
 
 export interface MyVoice {
@@ -85,11 +87,21 @@ interface Actions {
   attachStream: (userId: string, el: HTMLVideoElement) => () => void
   setUserVolume: (userId: string, volume: number) => void
   togglePtt: () => void
+  setEncoding: (encoding: Encoding) => void
   enableNotifications: () => Promise<void>
 }
 
 const VOLUMES_KEY = 'concord.volumes'
 const PTT_KEY_STORAGE = 'concord.ptt'
+const ENCODING_STORAGE = 'concord.encoding'
+
+function loadEncoding(): Encoding {
+  try {
+    return localStorage.getItem(ENCODING_STORAGE) === 'msgpack' ? 'msgpack' : 'json'
+  } catch {
+    return 'json'
+  }
+}
 
 function loadFlag(key: string): boolean {
   try {
@@ -158,6 +170,7 @@ const initial: State = {
   voiceStates: {},
   voice: idleVoice,
   userVolumes: loadVolumes(),
+  encoding: loadEncoding(),
 }
 
 function firstTextChannel(g: Guild): Channel | undefined {
@@ -394,8 +407,9 @@ export const useStore = create<State & Actions>()((set, get) => {
         gateway = null
         set({ ...initial, token: null })
       },
+      encoding: get().encoding,
     })
-    gateway.connect()
+    void gateway.connect()
   }
 
   if (initial.token) queueMicrotask(() => startGateway(initial.token!))
@@ -648,6 +662,16 @@ export const useStore = create<State & Actions>()((set, get) => {
 
     attachStream(userId, el) {
       return voiceClient.watch(userId, el)
+    },
+
+    setEncoding(encoding) {
+      set({ encoding })
+      try {
+        localStorage.setItem(ENCODING_STORAGE, encoding)
+      } catch {
+        /* sem armazenamento: vale só nesta sessão */
+      }
+      gateway?.setEncoding(encoding)
     },
 
     togglePtt() {

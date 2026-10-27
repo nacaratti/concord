@@ -30,7 +30,11 @@ export interface GatewayOptions {
   onDispatch: (t: string, d: any) => void
   onState: (state: ConnectionState) => void
   onAuthFailed: () => void
+  /** Codificação dos frames que o servidor manda. O cliente sempre envia JSON. */
+  encoding?: Encoding
 }
+
+export type Encoding = 'json' | 'msgpack'
 
 export class Gateway {
   private opts: GatewayOptions
@@ -47,13 +51,20 @@ export class Gateway {
     this.opts = opts
   }
 
-  connect() {
+  async connect() {
     this.stopped = false
     this.opts.onState(this.sessionId ? 'reconnecting' : 'connecting')
+    const encoding = this.opts.encoding ?? 'json'
+    // O decodificador de MessagePack só é baixado por quem ligou o protocolo binário.
+    const decode = encoding === 'msgpack' ? (await import('@msgpack/msgpack')).decode : null
+    if (this.stopped) return
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const ws = new WebSocket(`${proto}://${location.host}/gateway`)
+    // A compressão (permessage-deflate) o navegador negocia sozinho; só a codificação vai na URL.
+    const ws = new WebSocket(`${proto}://${location.host}/gateway?encoding=${encoding}`)
+    ws.binaryType = 'arraybuffer'
     this.ws = ws
-    ws.onmessage = (ev) => this.handle(JSON.parse(ev.data) as Frame)
+    ws.onmessage = (ev) =>
+      this.handle((typeof ev.data === 'string' ? JSON.parse(ev.data) : decode!(new Uint8Array(ev.data))) as Frame)
     ws.onclose = (ev) => {
       if (this.ws !== ws) return
       this.ws = null
@@ -93,6 +104,15 @@ export class Gateway {
     return this.sessionId
   }
 
+  /**
+   * Troca a codificação e reconecta. A sessão atual foi criada em outra codificação, então o RESUME
+   * é recusado (INVALID_SESSION) e o cliente faz um IDENTIFY novo, que já é o caminho normal.
+   */
+  setEncoding(encoding: Encoding) {
+    this.opts.encoding = encoding
+    this.ws?.close(4000, 'troca de codificação')
+  }
+
   /** Só para depuração: derruba o socket para ver o RESUME acontecer. */
   simulateDrop() {
     this.ws?.close(4000, 'queda simulada')
@@ -108,7 +128,7 @@ export class Gateway {
     const base = Math.min(30_000, 1000 * 2 ** this.attempts)
     const delay = base * (0.5 + Math.random())
     this.attempts++
-    this.reconnectTimer = window.setTimeout(() => this.connect(), delay)
+    this.reconnectTimer = window.setTimeout(() => void this.connect(), delay)
   }
 
   private handle(f: Frame) {

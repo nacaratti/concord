@@ -11,11 +11,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
 	"concord/internal/api"
 	"concord/internal/files"
 	"concord/internal/gateway"
+	"concord/internal/metrics"
 	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
 	"concord/internal/store"
@@ -54,6 +57,11 @@ func main() {
 		log.Warn("redis indisponível: rate limit fica desligado até ele voltar", "err", err)
 	}
 	limiter := ratelimit.New(rdb, log)
+	if os.Getenv("CONCORD_RATELIMIT") == "off" {
+		// Só para teste de carga: milhares de conexões do mesmo IP esbarrariam no limite de conexões.
+		log.Warn("RATE LIMIT DESLIGADO (CONCORD_RATELIMIT=off): nunca use em produção")
+		limiter = nil
+	}
 	trustProxy := os.Getenv("CONCORD_TRUST_PROXY") == "1"
 
 	origins := strings.Split(env("CONCORD_ORIGINS", "localhost:*,127.0.0.1:*"), ",")
@@ -64,6 +72,17 @@ func main() {
 		PublicURL: env("LIVEKIT_PUBLIC_URL", "ws://localhost:7880"),
 	}
 	hub.Limiter, hub.TrustProxy, hub.Voice = limiter, trustProxy, vc
+	switch mode := env("CONCORD_WS_COMPRESSION", "context"); mode {
+	case "context":
+		hub.Compression = websocket.CompressionContextTakeover
+	case "nocontext":
+		hub.Compression = websocket.CompressionNoContextTakeover
+	case "off":
+		hub.Compression = websocket.CompressionDisabled
+	default:
+		log.Error("CONCORD_WS_COMPRESSION deve ser context, nocontext ou off", "valor", mode)
+		os.Exit(1)
+	}
 	go hub.Run(ctx)
 
 	a := &api.API{Store: st, Hub: hub, IDs: snowflake.NewGenerator(1), Limiter: limiter, Voice: vc, Log: log, TrustProxy: trustProxy}
@@ -94,7 +113,27 @@ func main() {
 		mux.Handle("/", spa(dir))
 	}
 
-	srv := &http.Server{Addr: env("CONCORD_ADDR", ":8080"), Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	metrics.GaugeFunc("concord_gateway_sessions_connected", "Sessões do gateway com WebSocket aberto.", func() float64 {
+		c, _ := hub.SessionCounts()
+		return float64(c)
+	})
+	metrics.GaugeFunc("concord_gateway_sessions_resumable", "Sessões que caíram e ainda podem ser retomadas.", func() float64 {
+		_, r := hub.SessionCounts()
+		return float64(r)
+	})
+	metrics.GaugeFunc("concord_db_connections_in_use", "Conexões do pool do Postgres em uso.", func() float64 {
+		return float64(st.DB.Stat().AcquiredConns())
+	})
+	// /metrics fica numa porta separada, que não deve ser exposta na internet (o Caddy só publica a :8080).
+	go func() {
+		addr := env("CONCORD_METRICS_ADDR", ":9091")
+		log.Info("métricas em /metrics", "addr", addr)
+		if err := http.ListenAndServe(addr, promhttp.Handler()); err != nil {
+			log.Warn("servidor de métricas", "err", err)
+		}
+	}()
+
+	srv := &http.Server{Addr: env("CONCORD_ADDR", ":8080"), Handler: metrics.Middleware(mux), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

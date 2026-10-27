@@ -270,7 +270,7 @@ function CreateChannelModal({ guildId, kind, onClose }: { guildId: string; kind:
 }
 
 function UserPanel() {
-  const { me, myStatus, myActivity, setPresence, logout, connection, simulateDrop, enableNotifications } = useStore()
+  const { me, myStatus, myActivity, setPresence, logout, connection, simulateDrop, enableNotifications, encoding, setEncoding } = useStore()
   const [open, setOpen] = useState(false)
   const [activity, setActivity] = useState(myActivity)
   if (!me) return null
@@ -311,6 +311,13 @@ function UserPanel() {
               Ativar notificações de menção
             </button>
           )}
+          <button
+            className="popover-item"
+            onClick={() => setEncoding(encoding === 'json' ? 'msgpack' : 'json')}
+            title="MessagePack é binário, mas com a compressão do WebSocket o JSON fica menor (ver README)"
+          >
+            Protocolo: {encoding === 'json' ? 'JSON' : 'MessagePack (experimental)'}
+          </button>
           <button className="popover-item" onClick={simulateDrop} title="Derruba o WebSocket para ver o RESUME">
             Simular queda de conexão
           </button>

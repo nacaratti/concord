@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"concord/internal/metrics"
 )
 
 // Rule descreve um balde: até Burst ações seguidas, repostas a Rate por segundo.
@@ -65,6 +67,9 @@ func (l *Limiter) Allow(ctx context.Context, rule Rule, key string) (bool, time.
 	if err != nil {
 		l.log.Warn("rate limit indisponível", "err", err)
 		return true, 0
+	}
+	if res[0] != 1 {
+		metrics.RateLimited.WithLabelValues(rule.Name).Inc()
 	}
 	return res[0] == 1, time.Duration(res[1]) * time.Millisecond
 }

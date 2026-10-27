@@ -17,6 +17,27 @@ services:
       timeout: 3s
       retries: 30
 
+  # Backup automático: pg_dump ao subir e a cada 6 h, guardando 7 dias em infra/backups/.
+  # Em produção, copie essa pasta para fora do servidor (rclone, restic...): backup no mesmo disco não salva de disco perdido.
+  backup:
+    image: postgres:17-alpine
+    environment:
+      PGHOST: postgres
+      PGUSER: concord
+      PGPASSWORD: ${POSTGRES_PASSWORD:-concord}
+      PGDATABASE: concord
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-6}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-7}
+    volumes:
+      - ./backups:/backups
+      - ./backup/backup.sh:/usr/local/bin/backup.sh:ro
+      - ./backup/restore.sh:/usr/local/bin/restore.sh:ro
+    entrypoint: ["sh"]
+    command: ["/usr/local/bin/backup.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   redis:
     image: redis:7-alpine
     ports:
@@ -30,6 +51,7 @@ services:
       LIVEKIT_CONFIG: |
         port: 7880
         bind_addresses: ["0.0.0.0"]
+        prometheus_port: 6789 # só na rede interna do Compose, lido pelo Prometheus
         rtc:
           tcp_port: 7881
           udp_port: 7882
@@ -70,6 +92,53 @@ services:
     volumes:
       - s3data:/data
 
+  # Observabilidade (opcional): docker compose --profile metrics up -d
+  prometheus:
+    profiles: ["metrics"]
+    image: prom/prometheus:v3.15.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=15d"]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    profiles: ["metrics"]
+    image: grafana/grafana:13.2.4
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-concord}
+      # Em desenvolvimento qualquer um vê o painel sem login; editar exige o admin.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/concord.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+  # Teste de carga (opcional): docker compose --profile loadtest run --rm k6 run /scripts/gateway.js
+  # O servidor precisa estar com CONCORD_RATELIMIT=off. Variáveis: VUS, RATE, COMPRESSION (deflate|off).
+  k6:
+    profiles: ["loadtest"]
+    image: grafana/k6:2.3.0
+    volumes:
+      - ./loadtest:/scripts:ro
+    environment:
+      VUS: ${VUS:-1000}
+      RATE: ${RATE:-5}
+      COMPRESSION: ${COMPRESSION:-deflate}
+      RAMP: ${RAMP:-60}
+      HOLD: ${HOLD:-60}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
   # Servidor Go (API + gateway). Em desenvolvimento, prefira rodar com `go run` fora do Docker.
   server:
     profiles: ["full"]
@@ -89,3 +158,5 @@ services:
 volumes:
   pgdata:
   s3data:
+  promdata:
+  grafanadata:

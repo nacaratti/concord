@@ -16,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 
 	"concord/internal/auth"
+	"concord/internal/metrics"
 	"concord/internal/ratelimit"
 	"concord/internal/snowflake"
 	"concord/internal/store"
@@ -75,19 +76,34 @@ type Presence struct {
 
 type conn struct {
 	ws     *websocket.Conn
-	out    chan []byte
+	enc    Encoding
+	out    chan outMsg
 	closed chan struct{}
 	once   sync.Once
 }
 
-func (c *conn) send(b []byte) {
+// outMsg é um frame pronto na fila de saída. `at` é quando o evento foi publicado: a diferença até a
+// escrita no socket é o tempo de fan-out (concord_gateway_fanout_seconds).
+type outMsg struct {
+	data  []byte
+	event string
+	at    time.Time
+}
+
+func (c *conn) send(m outMsg) {
 	select {
-	case c.out <- b:
+	case c.out <- m:
 	case <-c.closed:
 	default:
 		// cliente lento demais: derruba, ele reconecta com RESUME
+		metrics.GatewaySlowConsumers.Inc()
 		go c.close(websocket.StatusPolicyViolation, "fila de saída cheia")
 	}
+}
+
+// sendControl envia frames fora da sequência (HELLO, HEARTBEAT_ACK, INVALID_SESSION).
+func (c *conn) sendControl(op int, d any) {
+	c.send(outMsg{data: control(c.enc, op, d)})
 }
 
 func (c *conn) close(code websocket.StatusCode, reason string) {
@@ -100,13 +116,21 @@ func (c *conn) close(code websocket.StatusCode, reason string) {
 func (c *conn) writeLoop(ctx context.Context) {
 	for {
 		select {
-		case b := <-c.out:
+		case m := <-c.out:
+			typ := websocket.MessageText
+			if c.enc == EncodingMsgpack {
+				typ = websocket.MessageBinary
+			}
 			wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := c.ws.Write(wctx, websocket.MessageText, b)
+			err := c.ws.Write(wctx, typ, m.data)
 			cancel()
 			if err != nil {
 				c.close(websocket.StatusGoingAway, "falha de escrita")
 				return
+			}
+			metrics.GatewayBytes.WithLabelValues(c.enc.String()).Add(float64(len(m.data)))
+			if metrics.FanoutEvents[m.event] && !m.at.IsZero() {
+				metrics.FanoutLatency.WithLabelValues(m.event).Observe(time.Since(m.at).Seconds())
 			}
 		case <-c.closed:
 			return
@@ -131,7 +155,8 @@ type bufferedEvent struct {
 type Session struct {
 	ID     string
 	UserID ID
-	Name   string // nome de exibição, mostrado aos outros na call
+	Name   string   // nome de exibição, mostrado aos outros na call
+	Enc    Encoding // fixa durante a vida da sessão: o buffer de RESUME guarda frames já codificados
 
 	mu         sync.Mutex
 	seq        int64
@@ -142,19 +167,26 @@ type Session struct {
 	guilds map[ID]struct{} // protegido por Hub.mu
 }
 
-func (s *Session) dispatch(t string, d json.RawMessage) {
+func (s *Session) dispatch(t string, p *payload, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	b, err := encodeFrame(s.Enc, OpDispatch, t, s.seq+1, p)
+	if err != nil {
+		return // payload que não vira MessagePack: não acontece com JSON válido
+	}
 	s.seq++
-	b := frame(OpDispatch, t, s.seq, d)
+	metrics.GatewayEvents.WithLabelValues(t).Inc()
 	s.buf = append(s.buf, bufferedEvent{s.seq, b})
 	if len(s.buf) > replayBuffer {
 		s.buf = s.buf[len(s.buf)-replayBuffer:]
 	}
 	if s.conn != nil {
-		s.conn.send(b)
+		s.conn.send(outMsg{data: b, event: t, at: at})
 	}
 }
+
+// dispatchNow publica um evento só para esta sessão.
+func (s *Session) dispatchNow(t string, d any) { s.dispatch(t, newPayload(raw(d)), time.Now()) }
 
 // ---- hub ----
 
@@ -168,6 +200,9 @@ type Hub struct {
 	TrustProxy bool
 	// Voice, quando definido, permite entrar em canais de voz (tokens do LiveKit).
 	Voice *voice.Config
+	// Compression é o permessage-deflate do WebSocket. Com contexto, corta ~80% da banda dos eventos
+	// (ver codec_test.go), ao custo de ~0,8–1,2 MB de memória por conexão.
+	Compression websocket.CompressionMode
 
 	mu          sync.Mutex
 	sessions    map[string]*Session
@@ -261,9 +296,9 @@ func (h *Hub) DispatchGuilds(guildIDs []ID, t string, d any) {
 		}
 	}
 	h.mu.Unlock()
-	payload := raw(d)
+	p, at := newPayload(raw(d)), time.Now()
 	for s := range targets {
-		s.dispatch(t, payload)
+		s.dispatch(t, p, at)
 	}
 }
 
@@ -276,9 +311,9 @@ func (h *Hub) DispatchUser(userID ID, t string, d any) {
 		targets = append(targets, s)
 	}
 	h.mu.Unlock()
-	payload := raw(d)
+	p, at := newPayload(raw(d)), time.Now()
 	for _, s := range targets {
-		s.dispatch(t, payload)
+		s.dispatch(t, p, at)
 	}
 }
 
@@ -331,17 +366,23 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: h.origins})
+	enc, ok := ParseEncoding(r.URL.Query().Get("encoding"))
+	if !ok {
+		http.Error(w, "encoding deve ser json ou msgpack", http.StatusBadRequest)
+		return
+	}
+	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: h.origins, CompressionMode: h.Compression})
 	if err != nil {
 		return
 	}
+	metrics.GatewayConnections.Inc()
 	ws.SetReadLimit(64 << 10)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	c := &conn{ws: ws, out: make(chan []byte, outQueue), closed: make(chan struct{})}
+	c := &conn{ws: ws, enc: enc, out: make(chan outMsg, outQueue), closed: make(chan struct{})}
 	go c.writeLoop(ctx)
-	c.send(frame(OpHello, "", 0, map[string]any{"heartbeat_interval": HeartbeatInterval.Milliseconds()}))
+	c.sendControl(OpHello, map[string]any{"heartbeat_interval": HeartbeatInterval.Milliseconds()})
 
 	sess := h.handshake(ctx, c)
 	if sess == nil {
@@ -365,7 +406,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		switch f.Op {
 		case OpHeartbeat:
-			c.send(frame(OpHeartbeatAck, "", 0, nil))
+			c.sendControl(OpHeartbeatAck, nil)
 		case OpPresence:
 			h.handlePresence(sess, f.D)
 		case OpVoiceStateUpdate:
@@ -430,9 +471,9 @@ func (h *Hub) handshake(ctx context.Context, c *conn) *Session {
 			if s := h.resume(c, user.ID, d.SessionID, d.Seq); s != nil {
 				return s
 			}
-			c.send(frame(OpInvalidSession, "", 0, false))
+			c.sendControl(OpInvalidSession, false)
 		case OpHeartbeat:
-			c.send(frame(OpHeartbeatAck, "", 0, nil))
+			c.sendControl(OpHeartbeatAck, nil)
 			attempt--
 		default:
 			c.close(CloseNotAuth, "não autenticado")
@@ -458,7 +499,7 @@ func (h *Hub) identify(ctx context.Context, c *conn, user store.User) (*Session,
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{ID: newSessionID(), UserID: user.ID, Name: user.DisplayName, guilds: map[ID]struct{}{}, conn: c}
+	s := &Session{ID: newSessionID(), UserID: user.ID, Name: user.DisplayName, Enc: c.enc, guilds: map[ID]struct{}{}, conn: c}
 
 	h.mu.Lock()
 	h.sessions[s.ID] = s
@@ -482,14 +523,14 @@ func (h *Hub) identify(ctx context.Context, c *conn, user store.User) (*Session,
 		h.presences[user.ID] = Presence{UserID: user.ID, Status: "online"}
 	}
 	// READY sai como seq 1, antes que qualquer outro evento alcance esta sessão.
-	s.dispatch("READY", raw(map[string]any{
+	s.dispatchNow("READY", map[string]any{
 		"session_id":   s.ID,
 		"user":         user,
 		"guilds":       guilds,
 		"presences":    h.presencesLocked(memberIDs),
 		"read_states":  readStates,
 		"voice_states": h.voiceStatesLocked(keys(s.guilds)),
-	}))
+	})
 	me := h.presences[user.ID]
 	h.mu.Unlock()
 
@@ -503,7 +544,8 @@ func (h *Hub) resume(c *conn, userID ID, sessionID string, seq int64) *Session {
 	h.mu.Lock()
 	s := h.sessions[sessionID]
 	h.mu.Unlock()
-	if s == nil || s.UserID != userID {
+	// A codificação faz parte da sessão: o buffer guarda frames já codificados.
+	if s == nil || s.UserID != userID || s.Enc != c.enc {
 		return nil
 	}
 	s.mu.Lock()
@@ -519,12 +561,12 @@ func (h *Hub) resume(c *conn, userID ID, sessionID string, seq int64) *Session {
 	replayed := 0
 	for _, e := range s.buf {
 		if e.seq > seq {
-			c.send(e.data)
+			c.send(outMsg{data: e.data})
 			replayed++
 		}
 	}
 	s.mu.Unlock()
-	s.dispatch("RESUMED", raw(map[string]any{"replayed": replayed}))
+	s.dispatchNow("RESUMED", map[string]any{"replayed": replayed})
 	return s
 }
 
@@ -565,4 +607,20 @@ func (h *Hub) handlePresence(s *Session, d json.RawMessage) {
 	}
 	h.mu.Unlock()
 	h.DispatchGuilds(keys(guilds), "PRESENCE_UPDATE", p)
+}
+
+// SessionCounts devolve quantas sessões estão conectadas e quantas caíram mas ainda podem ser retomadas.
+func (h *Hub) SessionCounts() (connected, resumable int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, s := range h.sessions {
+		s.mu.Lock()
+		if s.conn != nil {
+			connected++
+		} else {
+			resumable++
+		}
+		s.mu.Unlock()
+	}
+	return
 }

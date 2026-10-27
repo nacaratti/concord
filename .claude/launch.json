@@ -8,6 +8,13 @@
       "port": 8080
     },
     {
+      "name": "server-loadtest",
+      "runtimeExecutable": "C:\\Program Files\\Go\\bin\\go.exe",
+      "runtimeArgs": ["-C", "server", "run", "./cmd/concord"],
+      "env": { "CONCORD_RATELIMIT": "off" },
+      "port": 8080
+    },
+    {
       "name": "web",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "web", "run", "dev"],
